@@ -1255,7 +1255,8 @@ fn player_entry(path: &[u8]) -> Option<Entry> {
 /// `gen-2026-11-03.tsv`): ntdll's names were NTFS's for all 25 long names measured with an
 /// extension of three characters or fewer; for a longer extension they differ (`d.esmx`: ntdll
 /// `D6104~1.ES~`, NTFS `D6104~1.ESM`), so such a name's short name is `None` (not provided), as
-/// it is elsewhere than on Windows.
+/// it is elsewhere than on Windows. Under Wine (`ntdll::is_wine`) every name gets none, as on a
+/// volume with 8.3 names turned off.
 fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     let name = last_part(path);
     if short_extension(&name).is_none() {
@@ -1267,6 +1268,9 @@ fn short_name(e: &Engine, path: &[u8]) -> Option<String> {
     }
     #[cfg(windows)]
     {
+        if ntdll::is_wine() {
+            return Some(String::new());
+        }
         let cut = path.iter().rposition(|&b| b == b'\\' || b == b'/')?;
         let taken = names_in(e, &path[..cut]);
         let mut generator = ntdll::Generator::new(&name);
@@ -1332,6 +1336,26 @@ mod ntdll {
         extension_length: u32,
         extension_buffer: [u16; 4],
         last_index_value: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+    }
+
+    /// Wine and Proton: their ntdll exports `wine_get_version`, and their `RtlGenerate8dot3Name`
+    /// is a stub that aborts the process.
+    pub fn is_wine() -> bool {
+        static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *WINE.get_or_init(|| {
+            // SAFETY: both names are NUL-terminated; ntdll is loaded in every process.
+            unsafe {
+                let module = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+                !module.is_null()
+                    && !GetProcAddress(module, b"wine_get_version\0".as_ptr()).is_null()
+            }
+        })
     }
 
     #[link(name = "ntdll")]
