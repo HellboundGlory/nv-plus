@@ -2,7 +2,7 @@
   <img src="nv-plus.png" alt="NV+ logo: a ranger in a gas mask and long coat holding two revolvers in front of a Mojave sunset and ruins, inside a gear, above an NV+ banner" width="260">
 </p>
 
-<h1 align="center">NV+</h1>
+<h1 align="center"></h1>
 
 [![Built on nv-rs](https://img.shields.io/badge/Built_on-nv--rs-orange.svg)](https://github.com/slaterain/nv-rs)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](../LICENSE)
