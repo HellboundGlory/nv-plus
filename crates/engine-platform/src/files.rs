@@ -219,6 +219,31 @@ pub fn read_whole(e: &Engine, path: &[u8]) -> Option<Vec<u8>> {
     std::fs::read(real_path(path)).ok()
 }
 
+/// `data` becomes the bytes of the file at the full path `path` in the run (never on disk): a
+/// file the run does not have yet is taken in from the player's ([`adopt`]) or made ([`made`]),
+/// and its entry gets the size and times a closed write publishes ([`closed`]).
+pub fn write_whole(e: &mut Engine, path: &[u8], data: Vec<u8>) {
+    let k = key(path);
+    if !state_ref!(e).disk.files.contains_key(&k) {
+        let players = !state_ref!(e).disk.deleted.contains(&k)
+            && std::fs::metadata(real_path(path)).is_ok_and(|m| m.is_file());
+        if players {
+            adopt(e, path, &k, false);
+        } else {
+            made(e, path, &k);
+        }
+    }
+    let now = file_clock(e);
+    let size = data.len() as u64;
+    state!(e).disk.files.insert(k.clone(), data);
+    if let Some(entry) = state!(e).disk.entries.get_mut(&k) {
+        entry.size = size;
+        entry.accessed = now;
+        entry.written = now;
+        entry.attributes |= FILE_ATTRIBUTE_ARCHIVE;
+    }
+}
+
 /// The attributes of the full path `path` as Windows reports them: a file or directory the game
 /// made in this run, else the player's (`FILE_ATTRIBUTE_*` as the file system keeps them);
 /// `None` when there is none.
@@ -479,7 +504,7 @@ pub const ERROR_PATH_NOT_FOUND: u32 = 3;
 
 /// Whether the directory holding the full path `path` exists: one the game made in this run,
 /// else the player's (and not deleted).
-fn directory_exists(e: &Engine, path: &[u8]) -> bool {
+pub(crate) fn directory_exists(e: &Engine, path: &[u8]) -> bool {
     let trimmed = path.strip_suffix(b"\\").unwrap_or(path);
     let Some(cut) = trimmed.iter().rposition(|&b| b == b'\\' || b == b'/') else {
         return false;

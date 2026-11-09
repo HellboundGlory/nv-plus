@@ -1,7 +1,8 @@
 //! The profile (INI) file imports, `GetPrivateProfileIntA`, `GetPrivateProfileStringA` and
-//! `WritePrivateProfileStringA`: they read the files the game made in this run ([`files`]) and
-//! the Windows directory of the player's table ([`d3d9::windows_directory`]), so they are in the
-//! platform layer rather than the core (moved from `engine-core`'s `units/platform.rs`).
+//! `WritePrivateProfileStringA`: they read and change the files the game made in this run
+//! ([`files`]) and the Windows directory of the player's table ([`d3d9::windows_directory`]), so
+//! they are in the platform layer rather than the core (moved from `engine-core`'s
+//! `units/platform.rs`).
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -62,16 +63,21 @@ fn ini_value(text: &[u8], section: &[u8], key: &[u8]) -> Option<Vec<u8>> {
 /// player's table); the file as the game made it in this run when it did (`files`), else the
 /// player's file, read only. `None` when there is none.
 fn profile_text(e: &mut Engine, file: Ptr) -> Option<Vec<u8>> {
-    let name = e.mem.cstr(file.addr());
-    let path = if files::is_full_path(&name) {
-        name
-    } else {
-        let mut path = d3d9::windows_directory(e);
-        path.push(b'\\');
-        path.extend_from_slice(&name);
-        path
-    };
+    let path = profile_path(e, file);
     files::read_whole(e, &path)
+}
+
+/// The full path of the profile file `file` names: a name without a full path is in the Windows
+/// directory (`d3d9::windows_directory`, from the player's table).
+fn profile_path(e: &mut Engine, file: Ptr) -> Vec<u8> {
+    let name = e.mem.cstr(file.addr());
+    if files::is_full_path(&name) {
+        return name;
+    }
+    let mut path = d3d9::windows_directory(e);
+    path.push(b'\\');
+    path.extend_from_slice(&name);
+    path
 }
 
 // Platform: replaces KERNEL32.DLL GetPrivateProfileIntA (import)
@@ -179,15 +185,96 @@ pub fn get_private_profile_string_a(
 }
 
 // Platform: replaces KERNEL32.DLL WritePrivateProfileStringA (import)
-/// Answers success without writing: the platform never changes the player's files.
+/// `WritePrivateProfileStringA(section, key, value, file)`: the value is set in the run's copy
+/// of the file ([`files::write_whole`]), never the player's, and the answer is 1. A new key goes
+/// after its section's last non-blank line and a missing section at the end of the file (not
+/// measured); a null argument (a deletion, or `win.ini`) is not provided.
 pub fn write_private_profile_string_a(
-    _e: &mut Engine,
-    _section: Ptr,
-    _key: Ptr,
-    _value: Ptr,
-    _file: Ptr,
+    e: &mut Engine,
+    section: Ptr,
+    key: Ptr,
+    value: Ptr,
+    file: Ptr,
 ) -> u32 {
+    if section.is_null() || key.is_null() || value.is_null() || file.is_null() {
+        panic!("WritePrivateProfileStringA with a null argument is not provided");
+    }
+    let section = e.mem.cstr(section.addr());
+    let key = e.mem.cstr(key.addr());
+    let value = e.mem.cstr(value.addr());
+    let path = profile_path(e, file);
+    let text = match files::read_whole(e, &path) {
+        Some(text) => text,
+        None => {
+            assert!(
+                files::directory_exists(e, &path),
+                "WritePrivateProfileStringA(\"{}\"): a file in a directory that does not exist \
+                 is not provided",
+                String::from_utf8_lossy(&path)
+            );
+            Vec::new()
+        }
+    };
+    let text = set_profile_value(&text, &section, &key, &value);
+    files::write_whole(e, &path, text);
     1
+}
+
+/// `text` with `key=value` set in `section` ([`ini_value`]'s matching): an existing key keeps the
+/// key text and line ending it has in the file, a new key goes after its section's last non-blank
+/// line, and a missing section is appended at the end.
+fn set_profile_value(text: &[u8], section: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut in_section = false;
+    let mut found_section = false;
+    let mut insert_at = None;
+    let mut end = 0;
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let start = end;
+        end += line.len();
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let trimmed = body.trim_spaces();
+        if let Some(rest) = trimmed.strip_prefix(b"[") {
+            let name = rest.split(|&b| b == b']').next().unwrap_or(rest);
+            in_section = !found_section && name.trim_spaces().eq_ignore_ascii_case(section);
+            found_section |= in_section;
+            if in_section {
+                insert_at = Some(end);
+            }
+            continue;
+        }
+        if !in_section || trimmed.is_empty() {
+            continue;
+        }
+        insert_at = Some(end);
+        let Some(at) = body.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        if body[..at].trim_spaces().eq_ignore_ascii_case(key) {
+            let mut out = text[..start].to_vec();
+            out.extend_from_slice(&body[..=at]);
+            out.extend_from_slice(value);
+            out.extend_from_slice(&text[start + body.len()..]);
+            return out;
+        }
+    }
+    // A new key goes at `insert_at`; without its section, a new section goes at the end.
+    let at = insert_at.unwrap_or(text.len());
+    let mut out = text[..at].to_vec();
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    if insert_at.is_none() {
+        out.push(b'[');
+        out.extend_from_slice(section);
+        out.extend_from_slice(b"]\r\n");
+    }
+    out.extend_from_slice(key);
+    out.push(b'=');
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&text[at..]);
+    out
 }
 
 #[cfg(test)]
@@ -198,6 +285,213 @@ mod tests {
         let mut e = Engine::new();
         e.mem.map(0x1000, 0x1000);
         e
+    }
+
+    const PREFS: &[u8] = br"Z:\Data\FalloutPrefs.ini";
+
+    fn put(e: &mut Engine, s: &[u8]) -> Ptr {
+        let at = e.mem.alloc(s.len() as u32 + 1);
+        e.mem.set_cstr(at, s);
+        Ptr::new(at)
+    }
+
+    fn write(e: &mut Engine, section: &[u8], key: &[u8], value: &[u8], path: &[u8]) -> u32 {
+        let (s, k, v, f) = (put(e, section), put(e, key), put(e, value), put(e, path));
+        write_private_profile_string_a(e, s, k, v, f)
+    }
+
+    fn read(e: &mut Engine, section: &[u8], key: &[u8], path: &[u8]) -> Vec<u8> {
+        let buffer = e.mem.alloc(0x100);
+        let (s, k, f) = (put(e, section), put(e, key), put(e, path));
+        let n = get_private_profile_string_a(e, s, k, Ptr::NULL, Ptr::new(buffer), 0x100, f);
+        e.mem.bytes(buffer, n)
+    }
+
+    /// An existing key's value is replaced, keeping the key text and the line's ending; every
+    /// other byte of the file stays.
+    #[test]
+    fn a_written_value_replaces_the_key_in_place() {
+        const TEXT: &[u8] = b"; comment\r\n[General]\r\n sLanguage = ENGLISH \r\n[Controls]\r\nForward=\"0011FF00\"\r\nBack=1F\r\n";
+        let cases: &[(&[u8], &[u8], &[u8], &[u8], &[u8])] = &[
+            (
+                TEXT,
+                b"controls",
+                b"forward",
+                b"0022FF11",
+                b"; comment\r\n[General]\r\n sLanguage = ENGLISH \r\n[Controls]\r\nForward=0022FF11\r\nBack=1F\r\n",
+            ),
+            (
+                TEXT,
+                b"General",
+                b"slanguage",
+                b"FRENCH",
+                b"; comment\r\n[General]\r\n sLanguage =FRENCH\r\n[Controls]\r\nForward=\"0011FF00\"\r\nBack=1F\r\n",
+            ),
+            (b"[A]\nK=1\nL=2\n", b"A", b"K", b"9", b"[A]\nK=9\nL=2\n"),
+            (b"[A]\nK=1", b"A", b"K", b"9", b"[A]\nK=9"),
+        ];
+        for &(before, section, key, value, after) in cases {
+            let mut e = engine();
+            files::write_whole(&mut e, PREFS, before.to_vec());
+            assert_eq!(write(&mut e, section, key, value, PREFS), 1);
+            assert_eq!(files::read_whole(&e, PREFS).unwrap(), after.to_vec());
+            assert_eq!(read(&mut e, section, key, PREFS), value);
+        }
+    }
+
+    /// A write gives the file's entry its new size, the time as last access and last write,
+    /// and the archive bit, as a closed write does.
+    #[test]
+    fn a_write_updates_the_files_entry() {
+        let mut e = engine();
+        let dir = put(&mut e, br"Z:\Ini");
+        assert_eq!(files::create_directory_a(&mut e, dir, 0), 1);
+        let name = br"Z:\Ini\FalloutPrefs.ini";
+        state!(e).disk.clock = Some(0x1234);
+        assert_eq!(write(&mut e, b"Controls", b"Back", b"1F", name), 1);
+        state!(e).disk.clock = Some(0x5678);
+        assert_eq!(write(&mut e, b"Controls", b"Back", b"2EE", name), 1);
+        let entry = &state!(e).disk.entries[&br"z:\ini\falloutprefs.ini".to_vec()];
+        assert_eq!(
+            (entry.size, entry.created, entry.accessed, entry.written),
+            (22, 0x1234, 0x5678, 0x5678)
+        );
+        assert_ne!(entry.attributes & files::FILE_ATTRIBUTE_ARCHIVE, 0);
+    }
+
+    /// A new key in an existing section goes after that section's last non-blank line.
+    #[test]
+    fn a_new_key_follows_its_sections_last_line() {
+        let mut e = engine();
+        let text = b"[General]\r\nsLanguage=ENGLISH\r\n\r\n[Controls]\r\nForward=0011FF00\r\n\r\n[Save]\r\n";
+        files::write_whole(&mut e, PREFS, text.to_vec());
+        assert_eq!(write(&mut e, b"controls", b"Back", b"1F", PREFS), 1);
+        assert_eq!(
+            files::read_whole(&e, PREFS).unwrap(),
+            b"[General]\r\nsLanguage=ENGLISH\r\n\r\n[Controls]\r\nForward=0011FF00\r\nBack=1F\r\n\r\n[Save]\r\n".to_vec()
+        );
+        assert_eq!(read(&mut e, b"Controls", b"Back", PREFS), b"1F");
+    }
+
+    /// A missing section is appended, with a line ending first when the text does not end in one.
+    #[test]
+    fn a_new_section_is_appended() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                b"[General]\r\nsLanguage=ENGLISH\r\n",
+                b"[General]\r\nsLanguage=ENGLISH\r\n[Controls]\r\nBack=1F\r\n",
+            ),
+            (
+                b"[General]\r\nsLanguage=ENGLISH",
+                b"[General]\r\nsLanguage=ENGLISH\r\n[Controls]\r\nBack=1F\r\n",
+            ),
+        ];
+        for &(before, want) in cases {
+            let mut e = engine();
+            files::write_whole(&mut e, PREFS, before.to_vec());
+            assert_eq!(write(&mut e, b"Controls", b"Back", b"1F", PREFS), 1);
+            assert_eq!(files::read_whole(&e, PREFS).unwrap(), want.to_vec());
+            assert_eq!(read(&mut e, b"Controls", b"Back", PREFS), b"1F");
+        }
+    }
+
+    /// A missing file in a directory that exists is made with its section; the player's disk
+    /// keeps nothing.
+    #[test]
+    fn a_missing_file_in_an_existing_directory_is_made() {
+        let mut e = engine();
+        let dir = put(&mut e, br"Z:\Ini");
+        assert_eq!(files::create_directory_a(&mut e, dir, 0), 1);
+        let name = br"Z:\Ini\FalloutPrefs.ini";
+        assert_eq!(write(&mut e, b"Controls", b"Back", b"1F", name), 1);
+        assert_eq!(
+            files::read_whole(&e, name).unwrap(),
+            b"[Controls]\r\nBack=1F\r\n".to_vec()
+        );
+        assert_eq!(read(&mut e, b"Controls", b"Back", name), b"1F");
+        assert!(
+            !std::path::Path::new("Z:\\Ini\\FalloutPrefs.ini").exists(),
+            "nothing reaches the player's disk"
+        );
+    }
+
+    /// A name without a full path writes into the Windows directory, as reads find it there.
+    #[test]
+    fn a_bare_name_writes_into_the_windows_directory() {
+        let dir = std::env::temp_dir().join(format!("nv-rs-ini-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex: String = dir
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mut e = engine();
+        d3d9::load_adapter_table(&mut e, &format!("GetWindowsDirectoryA\t\t1\t{hex}\n"));
+        let mut path = dir.to_string_lossy().into_owned().into_bytes();
+        path.extend_from_slice(b"\\FalloutPrefs.ini");
+        assert_eq!(
+            write(&mut e, b"Controls", b"Back", b"1F", b"FalloutPrefs.ini"),
+            1
+        );
+        assert_eq!(
+            files::read_whole(&e, &path).unwrap(),
+            b"[Controls]\r\nBack=1F\r\n".to_vec()
+        );
+        assert_eq!(
+            read(&mut e, b"Controls", b"Back", b"FalloutPrefs.ini"),
+            b"1F"
+        );
+        let made_inside = std::fs::read_dir(&dir).unwrap().count();
+        let made_beside = std::fs::metadata(String::from_utf8_lossy(&path).as_ref()).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            (made_inside, made_beside),
+            (0, false),
+            "nothing reaches the disk"
+        );
+    }
+
+    /// A null section, key, value or file (a deletion, or `win.ini`) stops the run.
+    #[test]
+    fn a_null_argument_stops() {
+        for null in 0..4 {
+            let mut e = engine();
+            let mut args = [
+                put(&mut e, b"Controls"),
+                put(&mut e, b"Back"),
+                put(&mut e, b"1F"),
+                put(&mut e, PREFS),
+            ];
+            args[null] = Ptr::NULL;
+            let [s, k, v, f] = args;
+            let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_private_profile_string_a(&mut e, s, k, v, f)
+            }))
+            .expect_err("a null argument must stop");
+            let text = stop
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| stop.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(text.contains("not provided"), "argument {null}: {text}");
+        }
+    }
+
+    /// A file in a directory that does not exist stops the run.
+    #[test]
+    #[should_panic(expected = "not provided")]
+    fn a_missing_directory_stops() {
+        let mut e = engine();
+        write(
+            &mut e,
+            b"Controls",
+            b"Back",
+            b"1F",
+            br"Z:\NoSuch\FalloutPrefs.ini",
+        );
     }
 
     #[test]
@@ -262,7 +556,7 @@ mod tests {
         }
     }
 
-    /// A missing file gives the default, cut to the buffer; writing changes nothing and answers 1.
+    /// A missing file gives the default, cut to the buffer.
     #[test]
     fn profile_strings_fall_back_to_the_default() {
         let mut e = engine();
@@ -291,15 +585,5 @@ mod tests {
             Ptr::new(0x1060),
         );
         assert_eq!((n, e.mem.u8(0x1100)), (0, 0));
-        assert_eq!(
-            write_private_profile_string_a(
-                &mut e,
-                Ptr::new(0x1000),
-                Ptr::new(0x1020),
-                Ptr::new(0x1040),
-                Ptr::new(0x1060)
-            ),
-            1
-        );
     }
 }
