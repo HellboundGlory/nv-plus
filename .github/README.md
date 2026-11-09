@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="nv-plus.png" alt="NV+ logo: a ranger in a gas mask and long coat in front of a Mojave sunset, inside a gear" width="260">
+  <img src="nv-plus.png" alt="NV+ logo: a ranger in a gas mask and long coat holding two revolvers in front of a Mojave sunset and ruins, inside a gear, above an NV+ banner" width="260">
 </p>
 
 <h1 align="center">NV+</h1>
