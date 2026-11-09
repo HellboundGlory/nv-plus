@@ -1,0 +1,9 @@
+[package]
+name = "dsfx-edge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Prints the DirectSound distortion's edge correction table measured from this machine's dsdmo.dll, for engine-platform's sound layer (NV_DSFX_EDGE). Windows and Wine only, i686 target."
+
+# Standalone tool, not part of the root workspace. No dependencies.
+[workspace]

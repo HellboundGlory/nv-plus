@@ -32,3 +32,8 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   refused the table captured there. Without a sound device the game is silent, and a new game
   stalls at Doc Mitchell's. `dsound-capture` now writes those answers as Windows gives them when
   it runs under Wine.
+- **Muffled voices no longer stop the game under Wine and Proton.** Wine's `dsdmo.dll` can't run
+  the distortion, so the game couldn't measure its edge correction table and stopped at the first
+  muffled voice. `scripts/dsfx-edge`, a 32-bit tool run under Wine in a `winetricks dsdmo` prefix,
+  measures the table from Microsoft's DLL and prints it; the port reads that file when it can't
+  measure for itself.

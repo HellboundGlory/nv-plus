@@ -21,7 +21,8 @@
 //! The coefficients (`1000d8d0`) come from the parameters with the DLL's `f64` and `f32`
 //! roundings. One part is a table: the gain correction for each edge setting (32 values, two
 //! decimals each, not a formula). It is not in this file: [`edge_table`] measures it from the
-//! player's own `dsdmo.dll` at run time, through the effect's public interface.
+//! player's own `dsdmo.dll` at run time, through the effect's public interface, or reads a file
+//! that `scripts/dsfx-edge` measured with Microsoft's 32-bit DLL where the game's own cannot.
 //!
 //! The chain (`dsound.dll`, `CEffectChain`): the effect writes into a copy of the buffer
 //! (`PostFxBuffer`) that the mixer plays. When the buffer starts (`Play`, `10034ae0`) the
@@ -315,12 +316,44 @@ impl Chain {
 }
 
 /// The edge correction table of the player's `dsdmo.dll`, measured once through the effect's
-/// own interface ([`measure_edge_table`]); `None` when it cannot be measured (not Windows, no
-/// effect).
+/// own interface ([`measure_edge_table`]). When it cannot be measured, the file `NV_DSFX_EDGE`
+/// names is parsed instead ([`parse_edge_table`]); `None` when neither is available.
 pub fn edge_table() -> Option<&'static [f64; 32]> {
     static T: OnceLock<Option<[f64; 32]>> = OnceLock::new();
-    T.get_or_init(|| std::thread::spawn(measure_edge_table).join().ok().flatten())
-        .as_ref()
+    T.get_or_init(|| {
+        std::thread::spawn(measure_edge_table)
+            .join()
+            .ok()
+            .flatten()
+            .or_else(from_file)
+    })
+    .as_ref()
+}
+
+/// The table in the file `NV_DSFX_EDGE` names; a set variable with a bad file is an error.
+fn from_file() -> Option<[f64; 32]> {
+    let path = std::env::var_os("NV_DSFX_EDGE")?;
+    let path = std::path::Path::new(&path);
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("NV_DSFX_EDGE {}: {e}", path.display()));
+    Some(parse_edge_table(&text).unwrap_or_else(|e| panic!("NV_DSFX_EDGE {}: {e}", path.display())))
+}
+
+/// A table of 32 whitespace-separated finite positive decimals.
+pub fn parse_edge_table(text: &str) -> Result<[f64; 32], String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() != 32 {
+        return Err(format!("expected 32 values, found {}", words.len()));
+    }
+    let mut table = [0.0f64; 32];
+    for (slot, word) in table.iter_mut().zip(words) {
+        let v: f64 = word.parse().map_err(|_| format!("not a number: {word}"))?;
+        if !v.is_finite() || v <= 0.0 {
+            return Err(format!("not a positive number: {word}"));
+        }
+        *slot = v;
+    }
+    Ok(table)
 }
 
 /// Measures the edge correction: for each shift `n` (2 to 31) the effect, on a float stream at
@@ -331,18 +364,7 @@ pub fn edge_table() -> Option<&'static [f64; 32]> {
 pub fn measure_edge_table() -> Option<[f64; 32]> {
     let mut table = [1.0f64; 32];
     for (n, slot) in table.iter_mut().enumerate().skip(2) {
-        // An edge whose shift is n: (n - 1.5) / 29 * 100 percent (100 for the last).
-        let edge = (((n as f32 - 1.5) / 29.0) * 100.0).min(100.0);
-        let p: Params = [0.0, edge, 4000.0, 4000.0, 8000.0];
-        let unit = Coefficients::new(48000, p, &[1.0; 32]);
-        if unit.shift as usize != n {
-            return None;
-        }
-        let x = 0.5f32;
-        let w = shape((x * unit.input) * 32768.0, unit.shift);
-        let expected = (w * (1.0 / 32768.0)) * unit.gain;
-        let y = effect::first_output(p, x)?;
-        let ratio = f64::from(y) / f64::from(expected);
+        let ratio = edge_ratio(n, 0.5)?;
         let v = (ratio * 100.0).round() / 100.0;
         if !(1.0..=2.0).contains(&v) || (ratio - v).abs() > 0.002 {
             return None;
@@ -350,6 +372,22 @@ pub fn measure_edge_table() -> Option<[f64; 32]> {
         *slot = v;
     }
     Some(table)
+}
+
+/// The unrounded ratio of the effect's first output to the one computed here for an impulse `x`
+/// at shift `n`; `None` when `n` is not the shift of that edge, or the effect gives no output.
+pub fn edge_ratio(n: usize, x: f32) -> Option<f64> {
+    // An edge whose shift is n: (n - 1.5) / 29 * 100 percent (100 for the last).
+    let edge = (((n as f32 - 1.5) / 29.0) * 100.0).min(100.0);
+    let p: Params = [0.0, edge, 4000.0, 4000.0, 8000.0];
+    let unit = Coefficients::new(48000, p, &[1.0; 32]);
+    if unit.shift as usize != n {
+        return None;
+    }
+    let w = shape((x * unit.input) * 32768.0, unit.shift);
+    let expected = (w * (1.0 / 32768.0)) * unit.gain;
+    let y = effect::first_output(p, x)?;
+    Some(f64::from(y) / f64::from(expected))
 }
 
 /// The player's distortion effect, run once through COM (`dsdmo.dll`).
@@ -570,6 +608,44 @@ mod tests {
             assert_eq!(i16::from_le_bytes([s[0], s[1]]), y as i16);
             assert_eq!(s[0..2], s[2..4]);
         }
+    }
+
+    #[test]
+    fn an_edge_table_parses_from_whitespace() {
+        let words: Vec<String> = (0..32).map(|i| format!("{}.5", i % 3)).collect();
+        let text = format!("{}\t \n", words.join("\t "));
+        let want: [f64; 32] = std::array::from_fn(|i| (i % 3) as f64 + 0.5);
+        assert_eq!(parse_edge_table(&text), Ok(want));
+    }
+
+    #[test]
+    fn a_bad_edge_table_is_refused() {
+        let words = |count: usize| -> Vec<String> {
+            (0..count).map(|i| format!("{}", i as f64 + 0.5)).collect()
+        };
+        let with = |at: usize, word: &str| -> String {
+            let mut w = words(32);
+            w[at] = word.to_string();
+            w.join(" ")
+        };
+        let cases = [
+            (words(31).join(" "), "found 31"),
+            (words(33).join(" "), "found 33"),
+            (with(5, "two"), "two"),
+            (with(6, "0"), "not a positive number: 0"),
+            (with(7, "-1.5"), "-1.5"),
+            (with(8, "NaN"), "NaN"),
+        ];
+        for (text, reason) in cases {
+            let error = parse_edge_table(&text).unwrap_err();
+            assert!(error.contains(reason), "{error:?} does not name {reason:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_edge_table_cannot_be_measured_without_windows() {
+        assert_eq!(measure_edge_table(), None);
     }
 
     #[test]
