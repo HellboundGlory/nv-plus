@@ -1,0 +1,13 @@
+[package]
+name = "dsfx-edge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Prints the DirectSound distortion's edge correction table measured from this machine's dsdmo.dll, for the port's sound layer (NV_DSFX_EDGE). Windows and Wine only, i686 target."
+
+[dependencies]
+# The file reader that takes the printed table back (nv-plus/game/src/edge.rs).
+nv-plus-game = { path = "../game" }
+
+# Standalone tool, not part of the root workspace, so it keeps its own lock file.
+[workspace]

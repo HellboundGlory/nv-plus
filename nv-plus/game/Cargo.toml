@@ -1,0 +1,13 @@
+[package]
+name = "nv-plus-game"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.75"
+publish = false
+description = "NV+ features the upstream crates call through one-line hooks: the Wine check and the edge correction table read from a file"
+
+[lib]
+name = "nv_plus_game"
+
+[dependencies]
