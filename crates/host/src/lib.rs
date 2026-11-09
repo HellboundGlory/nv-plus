@@ -21,6 +21,7 @@ pub mod form_types;
 pub mod frame_log;
 pub mod game_file;
 pub mod mod_fit_worn;
+pub mod mouse_feel;
 pub mod native_inflate;
 pub mod phys_blend;
 pub mod player_move;

@@ -1660,6 +1660,10 @@ impl crate::Host {
             } else {
                 (motion, buttons)
             };
+        let (x, y) =
+            crate::mouse_feel::look(crate::uncap::screen(&self.engine), motion[0], motion[1]);
+        motion[0] = x;
+        motion[1] = y;
         let frame = self.movement.main_frames;
         for &(at, dx, dy, hold, mask) in mouse_script() {
             if frame >= at && frame < at + hold {

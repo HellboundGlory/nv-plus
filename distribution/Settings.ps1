@@ -6,12 +6,14 @@
 # none), which Play.exe passes on as NV_PRESET, NV_FRAME_LIMIT and NV_MENU_FRAME_LIMIT. Game threads one at
 # a time is the line NV_THREADS=stepped (the game's threads run side by side without it). Drawing on the
 # game's main thread is the line NV_RENDER_THREAD=0 (the drawing has a thread of its own without it).
+# Mouse smoothing and acceleration while looking around are the lines NV_MOUSE_SMOOTHING and
+# NV_MOUSE_ACCEL.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $folder = Join-Path $PSScriptRoot 'userdata'
 $file = Join-Path $folder 'settings.ini'
-$known = @('Borderless', 'Resolution', 'AntiAliasing', 'Anisotropy', 'VSync', 'Preset', 'FrameLimit', 'MenuFrameLimit', 'NV_THREADS', 'NV_RENDER_THREAD')
+$known = @('Borderless', 'Resolution', 'AntiAliasing', 'Anisotropy', 'VSync', 'Preset', 'FrameLimit', 'MenuFrameLimit', 'NV_THREADS', 'NV_RENDER_THREAD', 'NV_MOUSE_SMOOTHING', 'NV_MOUSE_ACCEL')
 # Play.exe makes the game's NV_PRESET, NV_FRAME_LIMIT and NV_MENU_FRAME_LIMIT from Preset, FrameLimit and
 # MenuFrameLimit, and NV_FIXES was never one of the game's switches: such lines would only look as if
 # they did something.
@@ -38,7 +40,7 @@ $form.Text = 'nv-rs settings'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size(360, 470)
+$form.ClientSize = New-Object System.Drawing.Size(360, 542)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
 $y = 16
@@ -99,6 +101,20 @@ $ownThread = 'Own thread (recommended)'
 $mainThread = 'Main thread (slower)'
 $rt = New-Combo @($ownThread, $mainThread) $(if ((Get-Setting 'NV_RENDER_THREAD' '').Trim() -eq '0') { $mainThread } else { $ownThread })
 Add-Row 'Drawing thread' $rt
+# Smoothing and acceleration while looking around, off by default. The game reads the four in any
+# case; a value written by hand that isn't one of them is kept as a choice of its own.
+function New-LevelCombo($name) {
+    $levels = @('Off', 'Light', 'Medium', 'Strong')
+    $value = (Get-Setting $name 'Off').Trim()
+    if ($value -eq '') { $value = 'Off' }
+    $match = @($levels | Where-Object { $_ -eq $value })
+    if ($match.Count -gt 0) { $value = $match[0] } else { $levels += $value }
+    New-Combo $levels $value
+}
+$sm = New-LevelCombo 'NV_MOUSE_SMOOTHING'
+Add-Row 'Mouse smoothing' $sm
+$ac = New-LevelCombo 'NV_MOUSE_ACCEL'
+Add-Row 'Mouse acceleration' $ac
 
 $note = New-Object System.Windows.Forms.Label
 $note.Text = "`"$own`" keeps what the game has now.`nBorderless fullscreen covers the main monitor."
@@ -108,13 +124,13 @@ $form.Controls.Add($note)
 
 $save = New-Object System.Windows.Forms.Button
 $save.Text = 'Save'
-$save.Location = New-Object System.Drawing.Point(184, 430)
+$save.Location = New-Object System.Drawing.Point(184, 502)
 $save.DialogResult = 'OK'
 $form.Controls.Add($save)
 $form.AcceptButton = $save
 $cancel = New-Object System.Windows.Forms.Button
 $cancel.Text = 'Cancel'
-$cancel.Location = New-Object System.Drawing.Point(268, 430)
+$cancel.Location = New-Object System.Drawing.Point(268, 502)
 $cancel.DialogResult = 'Cancel'
 $form.Controls.Add($cancel)
 $form.CancelButton = $cancel
@@ -123,6 +139,10 @@ if ($form.ShowDialog() -eq 'OK') {
     $threadLines = @()
     if ($th.SelectedIndex -eq 1) { $threadLines = @('NV_THREADS=stepped') }
     if ($rt.SelectedIndex -eq 1) { $threadLines += 'NV_RENDER_THREAD=0' }
+    # Off is the default, so it writes no line.
+    $mouseLines = @()
+    if ($sm.SelectedItem -ne 'Off') { $mouseLines += "NV_MOUSE_SMOOTHING=$($sm.SelectedItem)" }
+    if ($ac.SelectedItem -ne 'Off') { $mouseLines += "NV_MOUSE_ACCEL=$($ac.SelectedItem)" }
     $lines = @(
         '# nv-rs settings (written by Settings.cmd)'
         "Borderless=$(if ($mode.SelectedIndex -eq 0) { 1 } else { 0 })"
@@ -133,7 +153,7 @@ if ($form.ShowDialog() -eq 'OK') {
         "Preset=$(if ($pr.SelectedIndex -eq 1) { 'vanilla' } else { 'fixes' })"
         "FrameLimit=$(if ($fl.SelectedIndex -eq 0) { 0 } else { $fl.SelectedItem })"
         "MenuFrameLimit=$(if ($ml.SelectedIndex -eq 0) { 0 } else { $ml.SelectedItem })"
-    ) + $threadLines + $kept
+    ) + $threadLines + $mouseLines + $kept
     [void][IO.Directory]::CreateDirectory($folder)
     [IO.File]::WriteAllLines($file, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
 }
