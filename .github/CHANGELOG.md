@@ -34,8 +34,8 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   refuses, answers `DS_OK` where Windows says `DS_NO_VIRTUALIZATION`, accepts the reverb Windows 11
   refuses and can't set the distortion's gain, so the game's sound layer, which models Windows,
   refused the table captured there. Without a sound device the game is silent, and a new game
-  stalls at Doc Mitchell's. `dsound-capture` now writes those answers as Windows gives them when
-  it runs under Wine.
+  stalls at Doc Mitchell's. Play.exe writes the captured answers as Windows gives them when it
+  runs under Wine or Proton.
 - **Muffled voices no longer stop the game under Wine and Proton.** Wine's `dsdmo.dll` can't run
   the distortion, so the game couldn't measure its edge correction table and stopped at the first
   muffled voice. `nv-plus/dsfx-edge`, a 32-bit tool run under Wine in a `winetricks dsdmo` prefix,

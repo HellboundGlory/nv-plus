@@ -6,11 +6,6 @@
 //! `cargo run --release --target i686-pc-windows-msvc --manifest-path scripts/dsound-capture/Cargo.toml > %LOCALAPPDATA%\nv-rs\dsound.tsv`
 //! (or any file `NV_DSOUND_TABLE` names).
 //!
-//! Run under Wine or Proton, the plain capture's answers that the sound layer checks are written
-//! out as Windows gives them (`src/wine.rs`), because the layer models Windows and Wine differs
-//! on some buffer sizes and has no effects; one line on stderr says how many changed. The
-//! measurement modes are unaffected.
-//!
 //! What the game calls (see `crates/engine-platform/src/dsound.rs`):
 //! - `BSWin32Audio::Init` `00aea230`: `DirectSoundCreate8(NULL)`, `SetCooperativeLevel(window,
 //!   DSSCL_PRIORITY)`, `GetCaps`, the primary buffer (`DSBCAPS_PRIMARYBUFFER | DSBCAPS_CTRL3D |
@@ -46,8 +41,6 @@
 use std::ffi::c_void;
 use std::io::Write;
 
-mod wine;
-
 #[link(name = "dsound")]
 extern "system" {
     fn DirectSoundCreate8(device: *const u8, out: *mut *mut Obj, outer: *mut c_void) -> u32;
@@ -57,19 +50,7 @@ extern "system" {
     fn QueryPerformanceCounter(out: *mut i64) -> i32;
     fn QueryPerformanceFrequency(out: *mut i64) -> i32;
     fn Sleep(ms: u32);
-    fn GetModuleHandleA(name: *const u8) -> *mut c_void;
-    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
 }
-
-/// Wine and Proton export `wine_get_version` from ntdll, and Windows does not.
-fn under_wine() -> bool {
-    unsafe {
-        let module = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
-        !module.is_null()
-            && !GetProcAddress(module, c"wine_get_version".as_ptr() as *const u8).is_null()
-    }
-}
-
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassA(class: *const WndClassA) -> u16;
@@ -1388,94 +1369,81 @@ fn main() {
         }
         return;
     }
-    let mut capture_out = Vec::new();
-    if under_wine() && std::env::args().nth(1).is_none() {
-        unsafe { capture(&mut capture_out, only_setpos, only_replays) };
-        let (text, changed) = wine::windows_answers(&String::from_utf8_lossy(&capture_out));
-        o.write_all(text.as_bytes()).unwrap();
-        eprintln!(
-            "Wine: {changed} answers changed to Windows' (the game's sound layer models Windows)"
-        );
-    } else {
-        unsafe { capture(&mut o, only_setpos, only_replays) };
-    }
-}
-
-/// The plain capture and the two cursor modes, written to `o`.
-unsafe fn capture(o: &mut impl Write, only_setpos: bool, only_replays: bool) {
-    let window = window();
-    let mut ds: *mut Obj = std::ptr::null_mut();
-    let hr = DirectSoundCreate8(std::ptr::null(), &mut ds, std::ptr::null_mut());
-    writeln!(o, "DsCreate\t\t{hr:x}\t").unwrap();
-    if ds.is_null() {
-        writeln!(o, "DsEnd").unwrap();
-        return;
-    }
-    let hr = slot::<Fn2>(ds, 0x18)(ds, window as usize, 2);
-    writeln!(o, "DsCooperativeLevel\t2\t{hr:x}\t").unwrap();
-    if only_setpos {
-        setpos(o, ds);
-        release(ds);
-        writeln!(o, "DsEnd").unwrap();
-        return;
-    }
-    if only_replays {
-        replays(o, ds);
-        release(ds);
-        writeln!(o, "DsEnd").unwrap();
-        return;
-    }
-    let mut caps = [0u32; 0x18];
-    caps[0] = 0x60;
-    let hr = slot::<Fn1>(ds, 0x10)(ds, caps.as_mut_ptr() as usize);
-    writeln!(o, "DsCaps\t\t{hr:x}\t{}", hex(&bytes_of(&caps))).unwrap();
-    let primary = BufferDesc {
-        size: 0x24,
-        flags: 0x91,
-        bytes: 0,
-        reserved: 0,
-        format: std::ptr::null(),
-        alg: [0; 4],
-    };
-    let mut pb: *mut Obj = std::ptr::null_mut();
-    let hr = slot::<Fn3>(ds, 0xc)(
-        ds,
-        &primary as *const _ as usize,
-        &mut pb as *mut _ as usize,
-        0,
-    );
-    let mut pfmt = [0u8; 0x12];
-    let mut written = 0u32;
-    if !pb.is_null() {
-        slot::<Fn3>(pb, 0x14)(
-            pb,
-            pfmt.as_mut_ptr() as usize,
-            0x12,
-            &mut written as *mut _ as usize,
-        );
-    }
-    writeln!(o, "DsPrimary\t91\t{hr:x}\t{} {written:x}", hex(&pfmt)).unwrap();
-    if !pb.is_null() {
-        let (q, l) = qi(pb, &IID_LISTENER);
-        let mut all = [0u8; 0x40];
-        all[0] = 0x40;
-        let g = if l.is_null() {
-            0xffff_ffff
-        } else {
-            slot::<Fn1>(l, 0xc)(l, all.as_mut_ptr() as usize)
-        };
-        writeln!(o, "DsListener\t\t{q:x} {g:x}\t{}", hex(&all)).unwrap();
-        if !l.is_null() {
-            let r = slot::<FnF1>(l, 0x30)(l, 1.0, 0);
-            writeln!(o, "DsSet\tlistener doppler 3f800000\t{r:x}\t").unwrap();
-            release(l);
+    unsafe {
+        let window = window();
+        let mut ds: *mut Obj = std::ptr::null_mut();
+        let hr = DirectSoundCreate8(std::ptr::null(), &mut ds, std::ptr::null_mut());
+        writeln!(o, "DsCreate\t\t{hr:x}\t").unwrap();
+        if ds.is_null() {
+            writeln!(o, "DsEnd").unwrap();
+            return;
         }
+        let hr = slot::<Fn2>(ds, 0x18)(ds, window as usize, 2);
+        writeln!(o, "DsCooperativeLevel\t2\t{hr:x}\t").unwrap();
+        if only_setpos {
+            setpos(&mut o, ds);
+            release(ds);
+            writeln!(o, "DsEnd").unwrap();
+            return;
+        }
+        if only_replays {
+            replays(&mut o, ds);
+            release(ds);
+            writeln!(o, "DsEnd").unwrap();
+            return;
+        }
+        let mut caps = [0u32; 0x18];
+        caps[0] = 0x60;
+        let hr = slot::<Fn1>(ds, 0x10)(ds, caps.as_mut_ptr() as usize);
+        writeln!(o, "DsCaps\t\t{hr:x}\t{}", hex(&bytes_of(&caps))).unwrap();
+        let primary = BufferDesc {
+            size: 0x24,
+            flags: 0x91,
+            bytes: 0,
+            reserved: 0,
+            format: std::ptr::null(),
+            alg: [0; 4],
+        };
+        let mut pb: *mut Obj = std::ptr::null_mut();
+        let hr = slot::<Fn3>(ds, 0xc)(
+            ds,
+            &primary as *const _ as usize,
+            &mut pb as *mut _ as usize,
+            0,
+        );
+        let mut pfmt = [0u8; 0x12];
+        let mut written = 0u32;
+        if !pb.is_null() {
+            slot::<Fn3>(pb, 0x14)(
+                pb,
+                pfmt.as_mut_ptr() as usize,
+                0x12,
+                &mut written as *mut _ as usize,
+            );
+        }
+        writeln!(o, "DsPrimary\t91\t{hr:x}\t{} {written:x}", hex(&pfmt)).unwrap();
+        if !pb.is_null() {
+            let (q, l) = qi(pb, &IID_LISTENER);
+            let mut all = [0u8; 0x40];
+            all[0] = 0x40;
+            let g = if l.is_null() {
+                0xffff_ffff
+            } else {
+                slot::<Fn1>(l, 0xc)(l, all.as_mut_ptr() as usize)
+            };
+            writeln!(o, "DsListener\t\t{q:x} {g:x}\t{}", hex(&all)).unwrap();
+            if !l.is_null() {
+                let r = slot::<FnF1>(l, 0x30)(l, 1.0, 0);
+                writeln!(o, "DsSet\tlistener doppler 3f800000\t{r:x}\t").unwrap();
+                release(l);
+            }
+        }
+        buffers(&mut o, ds);
+        effects(&mut o, ds);
+        settings(&mut o, ds);
+        cursors(&mut o, ds);
+        release(pb);
+        release(ds);
+        writeln!(o, "DsEnd").unwrap();
     }
-    buffers(o, ds);
-    effects(o, ds);
-    settings(o, ds);
-    cursors(o, ds);
-    release(pb);
-    release(ds);
-    writeln!(o, "DsEnd").unwrap();
 }
