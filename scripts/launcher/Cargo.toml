@@ -15,5 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The mouse options' own key checks, so a Fallout.ini value the game wouldn't take is never
-# passed on as a variable that stops the start.
+# passed on as a variable that stops the start, and the sound table's answers as Windows gives
+# them when this runs under Wine or Proton.
 nv-plus-options = { path = "../../nv-plus/options" }
+nv-plus-game = { path = "../../nv-plus/game" }
