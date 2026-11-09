@@ -30,7 +30,7 @@ describes in [docs/PLAYTESTING.md](../docs/PLAYTESTING.md).
 | | What | Status |
 |---|---|---|
 | ✅ | **Everything in nv-rs** | Merged in from upstream as it lands |
-| ✅ | **Quality of life** | Settings changed in the game's menus are kept (fix offered upstream: [nv-rs#370](https://github.com/slaterain/nv-rs/issues/370)); starts under Wine (no sound there yet); optional mouse smoothing and acceleration for looking around, in Settings.cmd. More planned, such as Esc going back one menu level |
+| ✅ | **Quality of life** | Settings changed in the game's menus are kept (fix offered upstream: [nv-rs#370](https://github.com/slaterain/nv-rs/issues/370)); starts under Wine with sound; optional mouse smoothing and acceleration for looking around, in Settings.cmd. More planned, such as Esc going back one menu level |
 | ⬜ | **NV+ launcher** | Planned: a launcher written fully in Rust |
 | ⬜ | **Multiplayer and servers** | Planned: play together on dedicated servers, with server-side mods, admin tools and the rest of what running a server needs |
 

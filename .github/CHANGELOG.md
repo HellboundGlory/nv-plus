@@ -26,3 +26,9 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   short names of the files the game creates with a Windows call that Wine has only as a stub, which
   closes the game. Under Wine NV+ now gives those files no short name, as Windows does on a drive
   with short names turned off. ([#1](https://github.com/HellboundGlory/nv-rs/pull/1))
+- **Sound, and the opening, under Wine and Proton.** Wine's DirectSound makes some buffers Windows
+  refuses, answers `DS_OK` where Windows says `DS_NO_VIRTUALIZATION`, accepts the reverb Windows 11
+  refuses and can't set the distortion's gain, so the game's sound layer, which models Windows,
+  refused the table captured there. Without a sound device the game is silent, and a new game
+  stalls at Doc Mitchell's. `dsound-capture` now writes those answers as Windows gives them when
+  it runs under Wine.
