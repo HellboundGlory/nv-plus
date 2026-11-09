@@ -1,4 +1,26 @@
-//! The DirectSound distortion's edge correction table, read from the file `NV_DSFX_EDGE` names.
+//! The DirectSound distortion's edge correction table, read from the file `NV_DSFX_EDGE` names,
+//! else the built-in table under Wine.
+
+/// The edge correction table measured with `nv-plus/dsfx-edge` under Wine from Microsoft's 2002
+/// 32-bit `dsdmo.dll`; entries 20, 24 and 27 depend on the impulse and are written as 1. The game
+/// always sets edge 0, so it reads only entry 2.
+pub const WINE_TABLE: [f64; 32] = [
+    1.0, 1.0, 1.5, 1.75, 1.75, 1.4, 1.17, 1.88, 1.88, 1.5, 1.5, 1.25, 1.25, 2.14, 1.07, 1.0, 1.94,
+    1.72, 1.72, 1.63, 1.0, 1.41, 1.41, 1.29, 1.0, 1.19, 1.19, 1.0, 1.11, 1.07, 1.03, 1.0,
+];
+
+/// The table in the file `NV_DSFX_EDGE` names, else the built-in table under Wine.
+pub fn fallback() -> Option<[f64; 32]> {
+    choose(from_file(), crate::wine::is_wine())
+}
+
+fn choose(file: Option<[f64; 32]>, wine: bool) -> Option<[f64; 32]> {
+    match (file, wine) {
+        (Some(file), _) => Some(file),
+        (None, true) => Some(WINE_TABLE),
+        (None, false) => None,
+    }
+}
 
 /// The table in the file `NV_DSFX_EDGE` names; a set variable with a bad file is an error.
 pub fn from_file() -> Option<[f64; 32]> {
@@ -29,6 +51,28 @@ pub fn parse_edge_table(text: &str) -> Result<[f64; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_order_is_file_then_wine_table() {
+        let file: [f64; 32] = std::array::from_fn(|i| i as f64 + 0.5);
+        let cases = [
+            (Some(file), false, Some(file)),
+            (Some(file), true, Some(file)),
+            (None, true, Some(WINE_TABLE)),
+            (None, false, None),
+        ];
+        for (file, wine, want) in cases {
+            assert_eq!(choose(file, wine), want, "{file:?} wine={wine}");
+        }
+    }
+
+    #[test]
+    fn the_wine_table_is_what_dsfx_edge_printed() {
+        let text = "1 1 1.5 1.75 1.75 1.4 1.17 1.88 1.88 1.5 1.5 1.25 1.25 2.14 1.07 1 \
+                    1.94 1.72 1.72 1.63 1 1.41 1.41 1.29 1 1.19 1.19 1 1.11 1.07 1.03 1";
+        assert_eq!(parse_edge_table(text), Ok(WINE_TABLE));
+        assert_eq!(WINE_TABLE[2], 1.5);
+    }
 
     #[test]
     fn an_edge_table_parses_from_whitespace() {

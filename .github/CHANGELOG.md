@@ -40,4 +40,6 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   the distortion, so the game couldn't measure its edge correction table and stopped at the first
   muffled voice. `nv-plus/dsfx-edge`, a 32-bit tool run under Wine in a `winetricks dsdmo` prefix,
   measures the table from Microsoft's DLL and prints it; the port reads that file when it can't
-  measure for itself.
+  measure for itself. Play.exe needs no setup now: under Wine and Proton the game uses a built-in
+  copy of the table measured from Microsoft's 2002 DLL when it can't measure one and no
+  `NV_DSFX_EDGE` file is set.

@@ -22,7 +22,8 @@
 //! roundings. One part is a table: the gain correction for each edge setting (32 values, two
 //! decimals each, not a formula). It is not in this file: [`edge_table`] measures it from the
 //! player's own `dsdmo.dll` at run time, through the effect's public interface.
-//! Where it can't, `nv-plus-game` reads the table `nv-plus/dsfx-edge` printed (`NV_DSFX_EDGE`).
+//! Where it can't, `nv-plus-game` reads the table `nv-plus/dsfx-edge` printed (`NV_DSFX_EDGE`),
+//! else under Wine its built-in copy.
 //!
 //! The chain (`dsound.dll`, `CEffectChain`): the effect writes into a copy of the buffer
 //! (`PostFxBuffer`) that the mixer plays. When the buffer starts (`Play`, `10034ae0`) the
@@ -316,8 +317,8 @@ impl Chain {
 }
 
 /// The edge correction table of the player's `dsdmo.dll`, measured once through the effect's
-/// own interface ([`measure_edge_table`]), else the file `NV_DSFX_EDGE` names (`nv-plus-game`);
-/// `None` when neither works.
+/// own interface ([`measure_edge_table`]), else the file `NV_DSFX_EDGE` names, else under Wine
+/// `nv-plus-game`'s built-in table; `None` when none of them works.
 pub fn edge_table() -> Option<&'static [f64; 32]> {
     static T: OnceLock<Option<[f64; 32]>> = OnceLock::new();
     T.get_or_init(|| {
@@ -325,7 +326,7 @@ pub fn edge_table() -> Option<&'static [f64; 32]> {
             .join()
             .ok()
             .flatten()
-            .or_else(nv_plus_game::edge::from_file)
+            .or_else(nv_plus_game::edge::fallback)
     })
     .as_ref()
 }
