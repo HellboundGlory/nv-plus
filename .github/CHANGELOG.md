@@ -13,3 +13,7 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   Windows' profile-file call, which nv-rs answered without writing, so `FalloutPrefs.ini` came out
   unchanged and every change was lost at exit. Reported upstream with a fix:
   [nv-rs#370](https://github.com/slaterain/nv-rs/issues/370).
+- **Runs under Wine and Proton without closing on the first save.** nv-rs makes the old DOS-style
+  short names of the files the game creates with a Windows call that Wine has only as a stub, which
+  closes the game. Under Wine NV+ now gives those files no short name, as Windows does on a drive
+  with short names turned off. ([#1](https://github.com/HellboundGlory/nv-rs/pull/1))
