@@ -624,6 +624,8 @@ dependencies = [
  "engine",
  "engine-platform",
  "esm",
+ "nv-plus-game",
+ "nv-plus-options",
  "nvse",
  "play-patch",
  "zlib-rs",
@@ -747,6 +749,13 @@ dependencies = [
 
 [[package]]
 name = "nv-plus-game"
+version = "0.1.0"
+dependencies = [
+ "nv-plus-options",
+]
+
+[[package]]
+name = "nv-plus-options"
 version = "0.1.0"
 
 [[package]]

@@ -12,8 +12,6 @@
 use engine::prelude::*;
 use std::path::{Path, PathBuf};
 
-use crate::mouse_feel::{Feel, Natural};
-
 /// One fix: a behaviour that differs from the exe, registered at exe addresses.
 pub struct Fix {
     /// Its name in the start-up line and in docs/FIXES.md.
@@ -258,7 +256,7 @@ impl Preset {
 }
 
 /// What this run does, bound before the first frame ([`install`]).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
     pub preset: Preset,
     /// Frames a second at most, 0 for no limit. Only the uncapped step reads it: the original's
@@ -278,8 +276,8 @@ pub struct Choice {
     /// (`engine_platform::d3d9real::want_render_thread`): `NV_RENDER_THREAD=1` or `0` when set;
     /// else off for a test (as its threads are stepped); else [`PLAY_RENDER_THREAD`].
     pub render_thread: bool,
-    /// The look feel of `NV_MOUSE_SMOOTHING` and `NV_MOUSE_ACCEL`: off unless asked for.
-    pub mouse: Feel,
+    /// The look feel and the other NV+ options the run asked for.
+    pub nv_plus: nv_plus_options::Options,
     /// Whether the game's window has no frame and fills the screen
     /// (`engine_platform::d3d9real::want_borderless`): `NV_BORDERLESS` when set (`1` on, else
     /// off); else `Fallout.ini`'s `[nv-rs Display] bBorderless` (never for a test); `None` when
@@ -301,7 +299,7 @@ impl Choice {
             overrides: Vec::new(),
             threads: "stepped".to_string(),
             render_thread: false,
-            mouse: Feel::default(),
+            nv_plus: Default::default(),
             borderless: None,
             ini_note: None,
         }
@@ -452,7 +450,7 @@ impl Choice {
             render_thread: PLAY_RENDER_THREAD,
             borderless: ini.borderless,
             ini_note: ini.bad_line(),
-            mouse: Feel::default(),
+            nv_plus: Default::default(),
         };
         for line in settings.unwrap_or("").lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -529,7 +527,10 @@ impl Choice {
             Some("0") => choice.render_thread = false,
             Some(other) => return Err(format!("NV_RENDER_THREAD={other}: use 0 or 1")),
         }
-        choice.mouse = mouse_feel(&env)?;
+        choice.nv_plus = nv_plus_options::Options::read(
+            game_ini.filter(|_| is_play_run(&env) && !test && !command_line_test),
+            &env,
+        )?;
         Ok(choice)
     }
 
@@ -578,18 +579,8 @@ impl Choice {
         } else {
             format!("{menu}, frame limit {}", self.frame_limit)
         };
-        let mut mouse_line = String::new();
-        if self.mouse.smoothing_ms > 0.0 {
-            mouse_line.push_str(&format!("; mouse smoothing {} ms", self.mouse.smoothing_ms));
-        }
-        if let Some(natural) = self.mouse.accel {
-            mouse_line.push_str(&format!(
-                "; mouse acceleration limit {} ramp {}",
-                natural.limit, natural.ramp
-            ));
-        }
         format!(
-            "Preset {}: {}{limit}{mouse_line}; threads {}",
+            "Preset {}: {}{limit}; threads {}",
             self.preset.name(),
             if on.is_empty() {
                 "no fix on".to_string()
@@ -692,80 +683,13 @@ fn parse_limit(value: &str, source: &str) -> Result<u32, String> {
     })
 }
 
-/// The look feel of `NV_MOUSE_SMOOTHING` and `NV_MOUSE_ACCEL`, with `NV_MOUSE_ACCEL_LIMIT` and
-/// `NV_MOUSE_ACCEL_RAMP` replacing the preset's numbers. An empty value is unset.
-fn mouse_feel(env: &impl Fn(&str) -> Option<String>) -> Result<Feel, String> {
-    let read = |name: &str| {
-        env(name)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    let smoothing_ms = match read("NV_MOUSE_SMOOTHING").as_deref() {
-        None => 0.0,
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "off" => 0.0,
-            "light" => 20.0,
-            "medium" => 35.0,
-            "strong" => 50.0,
-            _ => match value.parse::<f64>() {
-                Ok(ms) if (0.0..=100.0).contains(&ms) => ms,
-                _ => {
-                    return Err(format!(
-                        "NV_MOUSE_SMOOTHING={value}: use Off, Light, Medium, Strong or milliseconds from 0 to 100"
-                    ))
-                }
-            },
-        },
-    };
-    let preset_limit = match read("NV_MOUSE_ACCEL").as_deref() {
-        None => None,
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "off" => None,
-            "light" => Some(1.25),
-            "medium" => Some(1.5),
-            "strong" => Some(2.0),
-            _ => {
-                return Err(format!(
-                    "NV_MOUSE_ACCEL={value}: use Off, Light, Medium or Strong"
-                ))
-            }
-        },
-    };
-    let number = |name: &str, range: &str, ok: fn(f64) -> bool| {
-        let Some(value) = read(name) else {
-            return Ok(None);
-        };
-        value
-            .parse::<f64>()
-            .ok()
-            .filter(|n| ok(*n))
-            .map(Some)
-            .ok_or_else(|| format!("{name}={value}: use a number {range}"))
-    };
-    // Checked even with acceleration off: Settings.cmd keeps these lines when it is turned off there.
-    let limit = number("NV_MOUSE_ACCEL_LIMIT", "from 1 to 4", |n| {
-        (1.0..=4.0).contains(&n)
-    })?;
-    let ramp = number("NV_MOUSE_ACCEL_RAMP", "above 0 and at most 10", |n| {
-        n > 0.0 && n <= 10.0
-    })?;
-    let accel = preset_limit.map(|preset| Natural {
-        limit: limit.unwrap_or(preset),
-        ramp: ramp.unwrap_or(0.1),
-    });
-    Ok(Feel {
-        smoothing_ms,
-        accel,
-    })
-}
-
 /// Registers each fix of the choice over its translation: run after every registration and
 /// before the game's first frame (EXTENDER-HOOKS R1). Each exe address has one implementation
 /// for the whole run.
 pub fn install(e: &mut Engine, choice: &Choice) {
     crate::uncap::set_frame_limit(choice.frame_limit);
     crate::uncap::set_menu_frame_limit(choice.bound_menu_frame_limit());
-    crate::mouse_feel::set(choice.mouse);
+    nv_plus_game::install(&choice.nv_plus);
     for fix in FIXES.iter().filter(|f| choice.is_on(f)) {
         (fix.install)(e);
     }
@@ -1460,147 +1384,23 @@ mod tests {
         assert_eq!(paths[1], Path::new("game/settings.ini"));
     }
 
-    fn feel(pairs: &'static [(&'static str, &'static str)]) -> Result<Feel, String> {
-        Choice::from_parts(None, env_of(pairs)).map(|choice| choice.mouse)
-    }
-
+    /// `Choice::build` reads the look feel through the NV+ crate: the preset word is the
+    /// crate's, a bad variable still stops the start, and the file's keys count only in a
+    /// launcher's play run.
     #[test]
-    fn the_mouse_feel_is_off_unless_asked_for() {
-        assert_eq!(Choice::vanilla().mouse, Feel::default());
-        let choice = Choice::from_parts(None, no_env).unwrap();
-        assert_eq!(choice.mouse, Feel::default());
-    }
-
-    #[test]
-    fn the_mouse_presets_and_numbers_parse() {
-        let smoothing = [
-            ("Off", 0.0),
-            ("light", 20.0),
-            (" Medium ", 35.0),
-            ("STRONG", 50.0),
-            ("7", 7.0),
-            ("0", 0.0),
-            ("100", 100.0),
-            ("2.5", 2.5),
-        ];
-        for (word, ms) in smoothing {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(Box::new([("NV_MOUSE_SMOOTHING", word)]));
-            assert_eq!(feel(pairs).unwrap().smoothing_ms, ms, "{word}");
-        }
-        let accel = [
-            ("Off", None),
-            ("Light", Some((1.25, 0.1))),
-            ("medium", Some((1.5, 0.1))),
-            ("STRONG", Some((2.0, 0.1))),
-            ("", None),
-            (" ", None),
-        ];
-        for (word, natural) in accel {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(Box::new([("NV_MOUSE_ACCEL", word)]));
-            let got = feel(pairs).unwrap().accel;
-            assert_eq!(
-                got,
-                natural.map(|(limit, ramp)| Natural { limit, ramp }),
-                "{word}"
-            );
-        }
-        let empty = feel(Box::leak(Box::new([("NV_MOUSE_SMOOTHING", "")]))).unwrap();
-        assert_eq!(empty, Feel::default());
-        let tuned = feel(Box::leak(Box::new([
-            ("NV_MOUSE_ACCEL", "Strong"),
-            ("NV_MOUSE_ACCEL_LIMIT", "3.5"),
-            ("NV_MOUSE_ACCEL_RAMP", "0.25"),
-        ])))
-        .unwrap();
-        assert_eq!(
-            tuned.accel,
-            Some(Natural {
-                limit: 3.5,
-                ramp: 0.25
-            })
-        );
-    }
-
-    #[test]
-    fn a_mouse_switch_that_cant_be_read_stops_the_start() {
-        for (name, value) in [
-            ("NV_MOUSE_SMOOTHING", "fast"),
-            ("NV_MOUSE_SMOOTHING", "-1"),
-            ("NV_MOUSE_SMOOTHING", "101"),
-            ("NV_MOUSE_ACCEL", "hard"),
-            ("NV_MOUSE_ACCEL", "3"),
-        ] {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(Box::new([(name, value)]));
-            let err = feel(pairs).unwrap_err();
-            assert!(err.starts_with(&format!("{name}={value}")), "{err}");
-        }
-        for (name, value) in [
-            ("NV_MOUSE_ACCEL_LIMIT", "0.5"),
-            ("NV_MOUSE_ACCEL_LIMIT", "5"),
-            ("NV_MOUSE_ACCEL_LIMIT", "wide"),
-            ("NV_MOUSE_ACCEL_RAMP", "0"),
-            ("NV_MOUSE_ACCEL_RAMP", "11"),
-            ("NV_MOUSE_ACCEL_RAMP", "fast"),
-        ] {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(Box::new([("NV_MOUSE_ACCEL", "Medium"), (name, value)]));
-            let err = feel(pairs).unwrap_err();
-            assert!(err.starts_with(&format!("{name}={value}")), "{err}");
-        }
-    }
-
-    /// The limit and ramp tune a preset: with acceleration off they do nothing (Settings.cmd keeps
-    /// hand-written lines when acceleration is turned off there), but a bad one is still an error.
-    #[test]
-    fn the_accel_numbers_do_nothing_while_accel_is_off() {
-        for pairs in [
-            vec![("NV_MOUSE_ACCEL_LIMIT", "1.8")],
-            vec![("NV_MOUSE_ACCEL_RAMP", "0.2")],
-            vec![("NV_MOUSE_ACCEL", "Off"), ("NV_MOUSE_ACCEL_LIMIT", "1.8")],
-            vec![("NV_MOUSE_ACCEL", ""), ("NV_MOUSE_ACCEL_RAMP", "0.2")],
-        ] {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(pairs.into_boxed_slice());
-            assert_eq!(feel(pairs).unwrap().accel, None, "{pairs:?}");
-        }
-        let err = feel(&[("NV_MOUSE_ACCEL_LIMIT", "9")]).unwrap_err();
-        assert!(
-            err.contains("NV_MOUSE_ACCEL_LIMIT=9: use a number from 1 to 4"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn the_start_up_line_names_the_mouse_feel_when_it_is_on() {
-        let off = Choice::from_parts(None, no_env).unwrap();
-        assert!(!off.describe().contains("mouse"), "{}", off.describe());
-        let smooth = Choice::from_parts(None, env_of(&[("NV_MOUSE_SMOOTHING", "Medium")])).unwrap();
-        assert!(
-            smooth.describe().contains("; mouse smoothing 35 ms"),
-            "{}",
-            smooth.describe()
-        );
-        let accel = Choice::from_parts(None, env_of(&[("NV_MOUSE_ACCEL", "Light")])).unwrap();
-        assert!(
-            accel
-                .describe()
-                .contains("; mouse acceleration limit 1.25 ramp 0.1"),
-            "{}",
-            accel.describe()
-        );
-        let both = Choice::from_parts(
-            None,
-            env_of(&[("NV_MOUSE_SMOOTHING", "7"), ("NV_MOUSE_ACCEL", "Strong")]),
-        )
-        .unwrap();
-        let line = both.describe();
-        assert!(line.contains("; mouse smoothing 7 ms"), "{line}");
-        assert!(
-            line.contains("; mouse acceleration limit 2 ramp 0.1"),
-            "{line}"
-        );
+    fn the_mouse_feel_comes_from_the_nv_plus_crate() {
+        let choice = Choice::from_parts(None, env_of(&[("NV_MOUSE_SMOOTHING", "Medium")])).unwrap();
+        assert_eq!(choice.nv_plus.mouse.smoothing_ms, 35.0);
+        let err = Choice::from_parts(None, env_of(&[("NV_MOUSE_ACCEL", "hard")])).unwrap_err();
+        assert!(err.starts_with("NV_MOUSE_ACCEL=hard"), "{err}");
+        let ini = "[nv-rs Mouse]\nsSmoothing=Light\n";
+        assert_eq!(with_ini(None, ini, &[]).nv_plus.mouse.smoothing_ms, 20.0);
+        let not_play = Choice::from_texts(None, Some(ini), no_env).unwrap();
+        assert_eq!(not_play.nv_plus.mouse.smoothing_ms, 0.0);
+        let test = with_ini(None, ini, &[("NV_TRACE_LIST", "x")]);
+        assert_eq!(test.nv_plus.mouse.smoothing_ms, 0.0);
+        let play = |name: &str| (name == "NV_SETTINGS").then(|| "x".to_string());
+        let marked = Choice::build(None, Some(ini), play, true).unwrap();
+        assert_eq!(marked.nv_plus.mouse.smoothing_ms, 0.0);
     }
 }

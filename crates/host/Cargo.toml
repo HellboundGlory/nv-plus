@@ -20,6 +20,9 @@ nvse = { path = "../nvse" }
 esm = { path = "../esm" }
 # zlib's inflate on the host for the game's compressed archives and records (`native_inflate`).
 zlib-rs = "0.6"
+# NV+'s own settings and features, called from here through one-line hooks (`fixes`, `player_move`).
+nv-plus-options = { path = "../../nv-plus/options" }
+nv-plus-game = { path = "../../nv-plus/game" }
 
 [dev-dependencies]
 # The BSA reader the host inflate's comparison with the exe's zlib reads the archives with.

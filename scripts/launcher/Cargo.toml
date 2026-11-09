@@ -10,5 +10,10 @@ description = "The preview package's Play.exe: finds the player's game, makes th
 name = "Play"
 path = "src/main.rs"
 
-# Standalone tool, not part of the root workspace. No dependencies.
+# Standalone tool, not part of the root workspace, so it keeps its own lock file.
 [workspace]
+
+[dependencies]
+# The mouse options' own key checks, so a Fallout.ini value the game wouldn't take is never
+# passed on as a variable that stops the start.
+nv-plus-options = { path = "../../nv-plus/options" }

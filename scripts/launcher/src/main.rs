@@ -1134,7 +1134,9 @@ fn play(
         |name| std::env::var_os(name).is_some(),
     );
     if let Some(bytes) = (!test).then(|| std::fs::read(&fallout_ini).ok()).flatten() {
-        let from_file = Settings::file_switches(&settings::decode(&bytes));
+        let text = settings::decode(&bytes);
+        let mut from_file = Settings::file_switches(&text);
+        from_file.extend(nv_plus_options::file_switches(&text));
         for (name, value) in &from_file {
             match value {
                 Some(value) => command.env(name, value),

@@ -15,6 +15,10 @@ Based on nv-rs `d0d1f375` (2026-11-09).
   faster hand movement further, rising smoothly to 1.25x, 1.5x or 2x. Menus keep the game's own
   cursor. For fine tuning, `settings.ini` takes `NV_MOUSE_SMOOTHING=<ms>` (0 to 100),
   `NV_MOUSE_ACCEL_LIMIT` (1 to 4) and `NV_MOUSE_ACCEL_RAMP` (above 0, at most 10; 0.1 by default).
+  The mouse options can also be set in the game's own `Fallout.ini`, in its `[nv-rs Mouse]` section
+  (`sSmoothing`, `sAcceleration`, `fAccelerationLimit`, `fAccelerationRamp`; see
+  `distribution/nv-plus-sections.ini`), which wins over `settings.ini` when the game is started
+  from `Play.exe`.
 
 ### Fixed
 

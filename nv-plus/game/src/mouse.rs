@@ -4,30 +4,10 @@
 //! any frame rate. Acceleration turns faster hand movement further, rising smoothly to a limit.
 //! Menus and loading screens keep the game's own cursor.
 
-use crate::uncap::Screen;
+use nv_plus_options::mouse::Feel;
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
-
-/// The feel the player asked for; both parts off is the original's behaviour.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct Feel {
-    pub smoothing_ms: f64,
-    pub accel: Option<Natural>,
-}
-
-/// A turn that grows with the hand's speed towards `limit` counts per count, `ramp` where it rises.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Natural {
-    pub limit: f64,
-    pub ramp: f64,
-}
-
-impl Feel {
-    fn is_off(&self) -> bool {
-        self.smoothing_ms == 0.0 && self.accel.is_none()
-    }
-}
 
 /// A frame's motion, spread over the smoothing window from `start` (seconds).
 #[derive(Clone, Copy)]
@@ -124,20 +104,20 @@ impl LookMouse {
 }
 
 /// Whether looking around runs: in play, with either part on.
-fn running(screen: Screen, feel: &Feel) -> bool {
-    screen == Screen::Play && !feel.is_off()
+fn running(in_play: bool, feel: &Feel) -> bool {
+    in_play && !feel.is_off()
 }
 
 /// One frame, with the time step given, so it can be tested without a clock or the statics.
 fn frame(
     mouse: &mut LookMouse,
-    screen: Screen,
+    in_play: bool,
     feel: &Feel,
     dx: i32,
     dy: i32,
     dt: f64,
 ) -> (i32, i32) {
-    if !running(screen, feel) {
+    if !running(in_play, feel) {
         mouse.reset();
         return (dx, dy);
     }
@@ -166,12 +146,12 @@ fn state() -> MutexGuard<'static, (LookMouse, Option<Instant>)> {
 
 /// The player's motion for the game's mouse, after the feel set by [`set`]: unchanged in a menu
 /// or a loading screen, and unchanged with both parts off.
-pub fn look(screen: Screen, dx: i32, dy: i32) -> (i32, i32) {
+pub fn look(in_play: bool, dx: i32, dy: i32) -> (i32, i32) {
     let feel = *feel_slot();
     let mut state = state();
     let (mouse, last) = &mut *state;
     let now = Instant::now();
-    let dt = if running(screen, &feel) {
+    let dt = if running(in_play, &feel) {
         last.replace(now).map_or(1.0 / 60.0, |previous| {
             now.duration_since(previous).as_secs_f64()
         })
@@ -179,12 +159,13 @@ pub fn look(screen: Screen, dx: i32, dy: i32) -> (i32, i32) {
         *last = None;
         0.0
     };
-    frame(mouse, screen, &feel, dx, dy, dt)
+    frame(mouse, in_play, &feel, dx, dy, dt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nv_plus_options::mouse::Natural;
 
     #[test]
     fn off_passes_counts_through_and_keeps_nothing() {
@@ -378,15 +359,10 @@ mod tests {
             smoothing_ms: 50.0,
             accel: None,
         };
-        for screen in [Screen::Menu, Screen::Loading] {
-            let mut mouse = LookMouse::default();
-            assert_eq!(
-                frame(&mut mouse, Screen::Play, &feel, 100, 0, 0.004),
-                (8, 0)
-            );
-            assert_eq!(frame(&mut mouse, screen, &feel, 3, -2, 0.004), (3, -2));
-            assert!(mouse.pending.is_empty());
-            assert_eq!(frame(&mut mouse, Screen::Play, &feel, 0, 0, 0.004), (0, 0));
-        }
+        let mut mouse = LookMouse::default();
+        assert_eq!(frame(&mut mouse, true, &feel, 100, 0, 0.004), (8, 0));
+        assert_eq!(frame(&mut mouse, false, &feel, 3, -2, 0.004), (3, -2));
+        assert!(mouse.pending.is_empty());
+        assert_eq!(frame(&mut mouse, true, &feel, 0, 0, 0.004), (0, 0));
     }
 }

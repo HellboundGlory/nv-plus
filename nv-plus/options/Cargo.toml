@@ -1,0 +1,13 @@
+[package]
+name = "nv-plus-options"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.75"
+publish = false
+description = "NV+'s own player settings: the look feel from the NV_MOUSE_* variables and Fallout.ini's [nv-rs Mouse] keys, and the checks on their values"
+
+[lib]
+name = "nv_plus_options"
+
+[dependencies]
