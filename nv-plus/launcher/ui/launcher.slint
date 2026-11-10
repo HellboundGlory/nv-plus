@@ -1,6 +1,5 @@
 // The launcher's home screen: frame, wasteland art, menu, patch-notes panel, status bar.
 
-import { ScrollView } from "std-widgets.slint";
 import { LoadingBar, Look, PlateButton, SquareButton, WindowButton } from "widgets.slint";
 
 export struct NoteItem {
@@ -15,6 +14,8 @@ export component LauncherWindow inherits Window {
     in property <bool> starting;
     in property <float> progress;
     in property <string> step;
+    // Flipped to make the renderer redraw the whole window.
+    in property <bool> repaint;
 
     callback play();
     callback quit();
@@ -32,6 +33,12 @@ export component LauncherWindow inherits Window {
     // The frame's inner edge.
     property <length> inset: 22px;
     property <int> percent: round(root.progress * 100);
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: root.repaint ? #ffffff00 : #00000000;
+    }
 
     // The window frame, its 34 px corner drawn at 22 px.
     Image {
@@ -78,6 +85,14 @@ export component LauncherWindow inherits Window {
         width: parent.width - 344px;
         height: 2px;
         background: Look.line;
+    }
+    // The top bar and its line fade in from the left column, as the wasteland scene does.
+    Rectangle {
+        x: 322px;
+        y: 22px;
+        width: 160px;
+        height: 74px;
+        background: @linear-gradient(90deg, #120d08 0%, #120d08e0 25%, #120d0800 100%);
     }
     WindowMoveArea {
         x: 322px;
@@ -268,13 +283,14 @@ export component LauncherWindow inherits Window {
                 height: parent.height - 46px - 26px;
                 background: transparent;
                 clip: true;
-                ScrollView {
-                    width: parent.width;
+                flick := Flickable {
+                    width: parent.width - 14px;
                     height: parent.height;
+                    content-width: self.width;
                     content-height: list.preferred-height;
 
                     list := VerticalLayout {
-                        width: parent.width - 14px;
+                        width: parent.width;
                         spacing: 0;
 
                         for note in root.notes: Rectangle {
@@ -291,7 +307,6 @@ export component LauncherWindow inherits Window {
                                 spacing: 0;
 
                                 HorizontalLayout {
-                                    width: parent.width;
                                     spacing: 12px;
 
                                     Text {
@@ -312,7 +327,6 @@ export component LauncherWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    width: parent.width;
                                     text: note.summary;
                                     color: Look.dim;
                                     font-family: Look.cond;
@@ -321,11 +335,45 @@ export component LauncherWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                                 Rectangle {
-                                    width: parent.width;
                                     height: 1px;
                                     background: #3a2c18;
                                 }
                             }
+                        }
+                    }
+                }
+                // The mockup's thin gold scroll bar, in its own column so it never covers the text.
+                if flick.content-height > flick.height: track := Rectangle {
+                    property <length> range: flick.content-height - flick.height;
+                    property <length> grab;
+                    x: parent.width - 8px;
+                    width: 8px;
+                    height: parent.height;
+                    border-radius: 4px;
+                    background: #1c150e;
+
+                    thumb := Rectangle {
+                        width: parent.width;
+                        height: max(24px, parent.height * flick.height / flick.content-height);
+                        y: (parent.height - self.height) * (-flick.content-y / parent.range);
+                        border-radius: 4px;
+                        background: drag.has-hover || drag.pressed ? #d09a2e : #a87a24;
+                    }
+                    drag := TouchArea {
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                                track.grab = self.mouse-y >= thumb.y && self.mouse-y <= thumb.y + thumb.height
+                                    ? self.mouse-y - thumb.y : thumb.height / 2;
+                                self.follow();
+                            }
+                        }
+                        moved => { self.follow(); }
+                        scroll-event(e) => {
+                            flick.content-y = clamp(flick.content-y + e.delta-y, -track.range, 0);
+                            accept
+                        }
+                        function follow() {
+                            flick.content-y = -clamp((self.mouse-y - track.grab) / (track.height - thumb.height), 0, 1) * track.range;
                         }
                     }
                 }
@@ -396,8 +444,11 @@ export component LauncherWindow inherits Window {
                 spacing: 14px;
                 horizontal-stretch: 1;
 
-                LoadingBar {
-                    progress: root.progress;
+                VerticalLayout {
+                    alignment: center;
+                    LoadingBar {
+                        progress: root.progress;
+                    }
                 }
                 Text {
                     horizontal-stretch: 1;

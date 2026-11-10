@@ -4,6 +4,7 @@ slint::include_modules!();
 
 mod dialogs;
 mod front;
+mod native;
 mod notes;
 
 use front::WindowFront;
@@ -146,6 +147,30 @@ fn main() {
     if let Err(e) = window.show() {
         dialogs::error(&format!("The launcher's window could not be shown: {e}"));
         return;
+    }
+    // The native window appears some time after the event loop starts.
+    let fitting = std::rc::Rc::new(slint::Timer::default());
+    {
+        let weak = window.as_weak();
+        let timer = std::rc::Rc::downgrade(&fitting);
+        fitting.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(20),
+            move || {
+                let Some(window) = weak.upgrade() else {
+                    return;
+                };
+                let wiped = weak.clone();
+                let fitted = native::fit(window.window(), move || {
+                    if let Some(window) = wiped.upgrade() {
+                        window.set_repaint(!window.get_repaint());
+                    }
+                });
+                if let Some(timer) = timer.upgrade().filter(|_| fitted) {
+                    timer.stop();
+                }
+            },
+        );
     }
     let _ = slint::run_event_loop_until_quit();
 }
