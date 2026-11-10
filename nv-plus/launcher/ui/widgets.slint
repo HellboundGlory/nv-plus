@@ -16,15 +16,15 @@ export global Look {
     out property <string> cond: "Barlow Condensed";
 }
 
-// The mockup's brightness(1.18) as a white wash.
-component Hue inherits Rectangle {
+// The plate with the mockup's hover filter baked in, faded in over the plain one.
+component Hue inherits Image {
     in property <bool> on;
-    background: white;
+    image-fit: fill;
     opacity: 0;
     animate opacity { duration: 120ms; }
     states [
         lit when root.on: {
-            opacity: 0.14;
+            opacity: 1;
         }
     ]
 }
@@ -44,6 +44,12 @@ export component PlateButton inherits Rectangle {
         width: parent.width;
         height: parent.height;
         image-fit: fill;
+    }
+    Hue {
+        source: root.gold ? @image-url("../assets/plate-gold-hover.png") : @image-url("../assets/plate-dark-hover.png");
+        width: parent.width;
+        height: parent.height;
+        on: touch.has-hover && root.enabled;
     }
     // The mockup's 2 px black drop shadow under the dark plates' lettering.
     if !root.gold: Text {
@@ -85,9 +91,6 @@ export component PlateButton inherits Rectangle {
         fill: transparent;
         commands: root.chevron;
     }
-    hue := Hue {
-        on: touch.has-hover && root.enabled;
-    }
     touch := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
@@ -113,6 +116,12 @@ export component SquareButton inherits Rectangle {
         height: parent.height;
         image-fit: fill;
     }
+    Hue {
+        source: @image-url("../assets/wb-plate-hover.png");
+        width: parent.width;
+        height: parent.height;
+        on: touch.has-hover;
+    }
     Path {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
@@ -127,9 +136,6 @@ export component SquareButton inherits Rectangle {
         commands: root.about
             ? "M 13 2.5 A 10.5 10.5 0 1 0 13 23.5 A 10.5 10.5 0 1 0 13 2.5 M 13 11.5 L 13 19 M 13 7.2 L 13 7.6"
             : "M 13 2.5 A 10.5 10.5 0 1 0 13 23.5 A 10.5 10.5 0 1 0 13 2.5 M 13 2.5 A 4.6 10.5 0 1 0 13 23.5 A 4.6 10.5 0 1 0 13 2.5 M 2.5 13 L 23.5 13 M 4.5 7.5 L 21.5 7.5 M 4.5 18.5 L 21.5 18.5";
-    }
-    hue := Hue {
-        on: touch.has-hover;
     }
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -150,6 +156,12 @@ export component WindowButton inherits Rectangle {
         height: parent.height;
         image-fit: fill;
     }
+    Hue {
+        source: root.close ? @image-url("../assets/wb-plate-close.png") : @image-url("../assets/wb-plate-hover.png");
+        width: parent.width;
+        height: parent.height;
+        on: touch.has-hover;
+    }
     Path {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
@@ -163,15 +175,12 @@ export component WindowButton inherits Rectangle {
         fill: transparent;
         commands: root.close ? "M 4 4 L 16 16 M 16 4 L 4 16" : "M 3 15 L 17 15";
     }
-    hue := Hue {
-        on: touch.has-hover;
-    }
     touch := TouchArea {
         clicked => { root.clicked(); }
     }
 }
 
-// 380 x 32 with the frame drawn at 9 px and the striped fill clipped to the progress.
+// 380 x 32 with the 9 px frame inside that box and the striped fill inside the frame.
 export component LoadingBar inherits Rectangle {
     in property <float> progress: 0;
 
@@ -184,10 +193,10 @@ export component LoadingBar inherits Rectangle {
         height: parent.height;
     }
     fill-clip := Rectangle {
-        x: 1px;
-        y: 1px;
-        height: parent.height - 2px;
-        width: max(0px, (parent.width - 4px) * root.progress);
+        x: 10px;
+        y: 10px;
+        height: parent.height - 20px;
+        width: max(0px, (parent.width - 20px) * root.progress);
         clip: true;
 
         Image {
