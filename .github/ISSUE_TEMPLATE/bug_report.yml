@@ -1,70 +1,106 @@
 name: Bug report
-description: Report a reproducible problem in nv-rs.
+description: Something in NV+ doesn't work as it should.
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Report behavior you can reproduce. Do not upload game assets, saves, recordings, executable data, or decompilation output. Before attaching an F12 report, review it for personal information such as local file paths, account names, or other identifying details. Redact those details while preserving the relevant diagnostic lines.
+        One problem per report, please. Screenshots are welcome; game files, saves and recordings are
+        not. Before pasting a log or error, remove your user name and folder paths.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where it happens
+      options:
+        - Launcher
+        - Starting the game
+        - Playing the game
+        - Settings
+        - Something else
+    validations:
+      required: true
   - type: input
     id: version
     attributes:
-      label: Build or commit
-      description: Include the version, commit, or package build you ran.
-      placeholder: e.g. release name or short commit hash
+      label: NV+ version
+      description: Type what the bottom of the launcher shows after "NV+", even if it says "dev".
+      placeholder: e.g. 1a2b3c4
     validations:
       required: true
-  - type: input
-    id: game_version
+  - type: dropdown
+    id: system
     attributes:
-      label: Game version and data source
-      description: Give the game edition/version and whether the Data directory is official base game data. Do not provide the directory path.
-      placeholder: e.g. Steam base game, no mods
+      label: How you run it
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows (other)
+        - Linux with Proton
+        - Linux with Wine
+        - Steam Deck
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Where your copy of the game is from
+      options:
+        - Steam
+        - GOG
+        - Epic
+        - Somewhere else
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often it happens
+      options:
+        - Every time
+        - Sometimes
+        - Once so far
     validations:
       required: true
   - type: textarea
-    id: mods
+    id: actual
     attributes:
-      label: Mods and load order
-      description: List relevant mods, plugins, and dependencies, or say none.
-      placeholder: Include versions and load order where relevant; omit local paths.
+      label: What happened
     validations:
       required: true
   - type: textarea
-    id: reproduction
+    id: steps
     attributes:
-      label: Steps to reproduce
-      description: Include the starting place/state and exact steps.
+      label: Steps to make it happen
+      description: Where you were in the game and what you did, step by step.
       placeholder: |
-        1. Start at ...
+        1. Start a new game
         2. ...
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: Expected behavior
+      label: What you expected
     validations:
       required: true
   - type: textarea
-    id: actual
+    id: setup
     attributes:
-      label: Actual behavior
-    validations:
-      required: true
+      label: More about your setup
+      description: Optional. Graphics card and driver, Proton or Wine version, anything else that seems related.
+      placeholder: e.g. RTX 4070, driver 566.36, Proton Experimental
   - type: textarea
-    id: report
+    id: log
     attributes:
-      label: F12 report or diagnostics
-      description: Paste only relevant diagnostics. Review for personal information and remove local paths, usernames, and identifying details first. Do not attach proprietary game files.
+      label: Error message or log
+      description: Paste only the lines that matter, with your user name and folder paths removed.
       render: text
-    validations:
-      required: false
-  - type: textarea
-    id: evidence
+  - type: checkboxes
+    id: checks
     attributes:
-      label: Comparison or supporting evidence
-      description: State what you compared against the original game, if applicable. Screenshots alone do not establish completion.
-    validations:
-      required: false
+      label: Before sending
+      options:
+        - label: I searched the open issues and this isn't one of them.
+          required: true

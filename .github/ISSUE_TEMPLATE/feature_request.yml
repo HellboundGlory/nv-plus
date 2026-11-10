@@ -1,0 +1,42 @@
+name: Feature idea
+description: Something you'd like NV+ to have or do.
+title: "[Idea]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Launcher
+        - Gameplay and controls
+        - Multiplayer and servers
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What NV+ should have or do.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it would fix or make better when you play.
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How it could work
+      description: Optional. Screens, settings, or another game that does it well.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before sending
+      options:
+        - label: I searched the open issues and this isn't one of them.
+          required: true
