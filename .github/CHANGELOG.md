@@ -5,7 +5,12 @@ changes come in with each merge and are listed in its pull requests, not here.
 
 ## Unreleased
 
-Based on nv-rs `d0d1f375` (2026-11-09).
+Based on nv-rs `96c0263d` (2026-11-10).
+
+### Added
+
+- **NV+ has its own launcher.** Launcher.exe replaces Play.exe: it shows a home screen with patch
+  notes, and Play starts the game with a loading bar. Its Settings, Mods and About screens are next.
 
 ### Fixed
 

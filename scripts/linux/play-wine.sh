@@ -2,7 +2,7 @@
 # Builds the NV+ package and plays it under Wine, for a Linux player with Fallout: New Vegas
 # from Steam.
 #
-#   scripts/linux/play-wine.sh [options] [-- Play.exe's own options]
+#   scripts/linux/play-wine.sh [options] [-- Launcher.exe's own options]
 #
 #   --game DIR     the game's folder; NV_RS_GAME is used when this is not given, and the folder is
 #                  looked for in your Steam libraries otherwise
@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
         --dry-run) dry_run=1; shift ;;
         -h | --help) usage; exit 0 ;;
         --) shift; extra=("$@"); break ;;
-        *) die "unknown option: $1 (Play.exe's own options go after --)" ;;
+        *) die "unknown option: $1 (Launcher.exe's own options go after --)" ;;
     esac
 done
 
@@ -122,14 +122,14 @@ if [ "$start" = 1 ] || [ "$dry_run" = 1 ]; then
     [ -f "$game/FalloutNV.exe" ] ||
         die "there is no FalloutNV.exe in $game. Pass --game with the folder that has it."
     game=$(realpath -- "$game")
-    # Play.exe looks for Steam in Windows' registry, which a new Wine prefix does not have, so the
-    # folder goes to it as Wine's own name for it.
+    # Launcher.exe looks for Steam in Windows' registry, which a new Wine prefix does not have, so
+    # the folder goes to it as Wine's own name for it.
     zpath=Z:${game//\//\\}
 fi
 
 if [ "$dry_run" = 1 ]; then
     printf 'game: %s\npackage: %s\nprefix: %s\n' "$game" "$package" "$WINEPREFIX"
-    printf 'wine: cd %q && wine ./Play.exe --game %q' "$package" "$zpath"
+    printf 'wine: cd %q && wine ./Launcher.exe --game %q' "$package" "$zpath"
     [ "${#extra[@]}" -eq 0 ] || printf ' %q' ${extra[@]+"${extra[@]}"}
     printf '\n'
     exit 0
@@ -171,9 +171,12 @@ check_tools || exit 2
 
 x64=$target/x86_64-pc-windows-gnu/release
 x86=$target/i686-pc-windows-gnu/release
-programs=("$x64/Play.exe" "$x64/nv-viewer.exe" "$x64/d3d9-capture.exe" "$x86/nvapi-capture.exe" "$x86/dsound-capture.exe")
+programs=("$x64/Launcher.exe" "$x64/nv-viewer.exe" "$x64/d3d9-capture.exe" "$x86/nvapi-capture.exe" "$x86/dsound-capture.exe")
 
 if [ "$build" = 1 ]; then
+    # The launcher's own licences must match its crates, or the package ships the wrong notices.
+    cargo run -q --manifest-path nv-plus/notices/Cargo.toml -- --manifest nv-plus/launcher/Cargo.toml --package nv-plus-launcher --target x86_64-pc-windows-gnu --target x86_64-pc-windows-msvc --out nv-plus/distribution --extra "Barlow-Condensed=nv-plus/launcher/assets/fonts/OFL-Barlow.txt" --check ||
+        die "The launcher's licence notices are stale, or nv-plus/notices did not run: see nv-plus/notices/README.md."
     # A static C runtime, so the programs don't need MinGW's DLLs, and the build machine's folders
     # kept out of them. Cargo's output goes to NV_PLUS_HOME's own target/, so a developer's is not
     # rebuilt with these flags.
@@ -182,7 +185,7 @@ if [ "$build" = 1 ]; then
     export CARGO_ENCODED_RUSTFLAGS="-C${sep}target-feature=+crt-static${sep}--remap-path-prefix=${repo}=nv-rs${sep}--remap-path-prefix=${cargo_home}/registry/src=cargo${sep}--remap-path-prefix=${rustup_home}=rustup"
     cargo build --release --locked --target x86_64-pc-windows-gnu -p nv-viewer
     cargo build --release --locked --target x86_64-pc-windows-gnu \
-        --manifest-path scripts/launcher/Cargo.toml
+        --manifest-path nv-plus/launcher/Cargo.toml --bin Launcher
     cargo build --release --locked --target x86_64-pc-windows-gnu \
         --manifest-path scripts/d3d9-capture/Cargo.toml
     cargo build --release --locked --target i686-pc-windows-gnu \
@@ -195,21 +198,25 @@ for program in "${programs[@]}"; do
     [ -f "$program" ] || die "$program is not built yet: run without --no-build once."
 done
 
-# The package as the Windows ZIP has it, except userdata (Play.exe's profile, tables, saves and
+# The package as the Windows ZIP has it, except userdata (Launcher.exe's profile, tables, saves and
 # logs) and the player's mods, which must survive a rebuild.
 rm -rf "$package/app" "$package/licenses"
+rm -f "$package/Play.exe" "$package/Play with mods.cmd" "$package/Import my saves.cmd"
 mkdir -p "$package/app/tools" "$package/mods"
-cp "$x64/Play.exe" "$package/Play.exe"
+cp "$x64/Launcher.exe" "$package/Launcher.exe"
 cp "$x64/nv-viewer.exe" "$package/app/FalloutNV.exe"
 cp "$x64/d3d9-capture.exe" "$package/app/tools/d3d9-capture.exe"
 cp "$x86/nvapi-capture.exe" "$package/app/tools/nvapi-capture.exe"
 cp "$x86/dsound-capture.exe" "$package/app/tools/dsound-capture.exe"
-for file in 'Play with mods.cmd' 'Import my saves.cmd' Settings.cmd Settings.ps1 \
-    'READ ME.txt' THIRD-PARTY-NOTICES.txt; do
+for file in Settings.cmd Settings.ps1 THIRD-PARTY-NOTICES.txt; do
     cp "$repo/distribution/$file" "$package/$file"
 done
-cp "$repo/distribution/mods/READ ME.txt" "$package/mods/READ ME.txt"
+for file in 'READ ME.txt' LAUNCHER-NOTICES.txt; do
+    cp "$repo/nv-plus/distribution/$file" "$package/$file"
+done
+cp "$repo/nv-plus/distribution/mods/READ ME.txt" "$package/mods/READ ME.txt"
 cp -R "$repo/distribution/licenses" "$package/licenses"
+cp -R "$repo/nv-plus/distribution/licenses/." "$package/licenses"
 cp "$repo/LICENSE" "$repo/LEGAL.md" "$package"
 cp "$repo/crates/vorbis/LICENSE-libvorbis" "$repo/crates/nvse/LICENSE-msvc-stl" \
     "$package/licenses"
@@ -229,6 +236,6 @@ fi
 
 cd "$package"
 status=0
-wine ./Play.exe --game "$zpath" ${extra[@]+"${extra[@]}"} || status=$?
+wine ./Launcher.exe --game "$zpath" ${extra[@]+"${extra[@]}"} || status=$?
 printf 'logs: %s\n' "$package/userdata/logs"
 exit "$status"

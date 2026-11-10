@@ -10,9 +10,5 @@ description = "The preview package's Play.exe: finds the player's game, makes th
 name = "Play"
 path = "src/main.rs"
 
-# Standalone tool, not part of the root workspace, so it keeps its own lock file.
+# Standalone tool, not part of the root workspace. No dependencies.
 [workspace]
-
-[dependencies]
-# The sound table's answers as Windows gives them when this runs under Wine or Proton.
-nv-plus-game = { path = "../../nv-plus/game" }

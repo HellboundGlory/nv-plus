@@ -5,10 +5,3 @@ version = 4
 [[package]]
 name = "launcher"
 version = "0.1.0"
-dependencies = [
- "nv-plus-game",
-]
-
-[[package]]
-name = "nv-plus-game"
-version = "0.1.0"

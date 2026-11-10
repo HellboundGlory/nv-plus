@@ -31,7 +31,7 @@ describes in [docs/PLAYTESTING.md](../docs/PLAYTESTING.md).
 |---|---|---|
 | ✅ | **Everything in nv-rs** | Merged in from upstream as it lands |
 | ✅ | **Quality of life** | Settings changed in the game's menus are kept (fix offered upstream: [nv-rs#370](https://github.com/slaterain/nv-rs/issues/370)); starts under Wine with sound. More planned, such as Esc going back one menu level |
-| ⬜ | **NV+ launcher** | Planned: a launcher written fully in Rust |
+| 🚧 | **NV+ launcher** | In progress: Launcher.exe with its home screen and Play; Settings, Mods and About screens next |
 | ⬜ | **Multiplayer and servers** | Planned: play together on dedicated servers, with server-side mods, admin tools and the rest of what running a server needs |
 
 ## How it relates to nv-rs

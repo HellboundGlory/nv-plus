@@ -1023,7 +1023,7 @@ fn import_saves(
         return Ok(0);
     }
     if !front.ask(&format!(
-        "Copy {} saves into nv-rs's own folder?\n\nFrom (only read, nothing there changes):\n{}\n\nTo:\n{}\n\nA save already there stays as it is. A save made with mods needs those mods: use Play with mods for it.",
+        "Copy {} saves into nv-rs's own folder?\n\nFrom (only read, nothing there changes):\n{}\n\nTo:\n{}\n\nA save already there stays as it is. A save made with mods needs those mods: start Launcher.exe --mods for it.",
         saves.len(),
         source.display(),
         profile.saves.display()

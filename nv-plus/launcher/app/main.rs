@@ -20,9 +20,13 @@ fn package_root() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Play.exe's arguments, plus `NV_RS_NO_WINDOWS=1`: no window, straight through the library.
+/// `--game FOLDER` alone still opens the window, so Wine, with no Steam in its registry, can be
+/// told where the game is. `NV_RS_NO_WINDOWS=1` or any other argument runs quiet, through the library.
 fn quiet_run(args: &[String]) -> bool {
-    !args.is_empty() || std::env::var_os("NV_RS_NO_WINDOWS").is_some_and(|v| v == "1")
+    if std::env::var_os("NV_RS_NO_WINDOWS").is_some_and(|v| v == "1") {
+        return true;
+    }
+    !(args.is_empty() || matches!(args, [flag, _] if flag == "--game"))
 }
 
 /// Puts the window back when a start ends, also when it panics, so Play never stays disabled and
@@ -115,6 +119,7 @@ fn main() {
     });
     {
         let weak = window.as_weak();
+        let game_args = args.clone();
         window.on_play(move || {
             if starting.swap(true, Ordering::SeqCst) {
                 return;
@@ -126,13 +131,14 @@ fn main() {
             }
             let front = WindowFront::new(Some(weak.clone()));
             let game_root = root.clone();
+            let play_args = game_args.clone();
             let done = StartDone {
                 window: weak.clone(),
                 starting: starting.clone(),
             };
             std::thread::spawn(move || {
                 let _done = done;
-                nv_plus_launcher::launch(&front, game_root, &[]);
+                nv_plus_launcher::launch(&front, game_root, &play_args);
             });
         });
     }
@@ -142,4 +148,27 @@ fn main() {
         return;
     }
     let _ = slint::run_event_loop_until_quit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_window_opens_for_the_game_folder_alone() {
+        let cases = [
+            (vec![], false),
+            (vec!["--game", "C:\\Games\\FalloutNV"], false),
+            (vec!["--game", "C:\\Games\\FalloutNV", "--mods"], true),
+            (vec!["--check"], true),
+            (vec!["--game"], true),
+        ];
+        for (raw, quiet) in cases {
+            assert_eq!(quiet_run(&args(&raw)), quiet, "{raw:?}");
+        }
+    }
 }

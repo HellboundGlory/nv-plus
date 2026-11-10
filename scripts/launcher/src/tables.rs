@@ -251,7 +251,6 @@ pub fn make_sound_table(
         log,
         SOUND_TOOL_LIMIT,
     )?;
-    let bytes = nv_plus_game::wine::sound_table(bytes, log)?;
     sound_state(&String::from_utf8_lossy(&bytes))?;
     write_whole(table, &bytes).map_err(|e| format!("{}: {e}", table.display()))?;
     write_whole(stamp, fingerprint.as_bytes()).map_err(|e| format!("{}: {e}", stamp.display()))?;
