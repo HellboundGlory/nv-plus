@@ -26,10 +26,20 @@ pub fn windows_allowed() -> bool {
 
 /// Opens a folder in Explorer (after an error, so the player finds the log).
 pub fn open_folder(path: &std::path::Path) {
-    if !windows_allowed() {
-        return;
+    if windows_allowed() {
+        open(path.as_os_str());
     }
-    let (verb, file) = (wide_str("open"), wide(path.as_os_str()));
+}
+
+/// Opens `url` in the player's browser.
+pub fn open_link(url: &str) {
+    if windows_allowed() {
+        open(std::ffi::OsStr::new(url));
+    }
+}
+
+fn open(target: &std::ffi::OsStr) {
+    let (verb, file) = (wide_str("open"), wide(target));
     // SAFETY: the strings live through the call; 1 is SW_SHOWNORMAL.
     unsafe {
         ShellExecuteW(

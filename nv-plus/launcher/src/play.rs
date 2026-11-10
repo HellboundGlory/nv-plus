@@ -251,13 +251,13 @@ fn player_folder_of(root: &Path, folders: &[(PathBuf, &'static str)]) -> Option<
 /// Why the package can't run from where it is.
 fn check_location(package: &Package) -> Result<(), Stop> {
     let root = folder_key(&package.root);
-    let move_it = "Move the whole nv-rs folder somewhere else, for example C:\\Games\\nv-rs, and start Play.exe again.";
+    let move_it = "Move the whole nv-rs folder somewhere else, for example C:\\Games\\nv-rs, and start Launcher.exe again.";
     let temporary = std::env::var_os("TEMP").map(|t| folder_key(Path::new(&t)));
     if temporary.is_some_and(|t| is_inside(&root, &t)) {
         return stop(
             STOP_LOCATION,
             format!(
-                "nv-rs is running from a temporary folder, which usually means from inside the ZIP.\n\nExtract the whole ZIP to a folder first (for example C:\\Games\\nv-rs), then start Play.exe there.\n\nThis folder was:\n{}",
+                "nv-rs is running from a temporary folder, which usually means from inside the ZIP.\n\nExtract the whole ZIP to a folder first (for example C:\\Games\\nv-rs), then start Launcher.exe there.\n\nThis folder was:\n{}",
                 package.root.display()
             ),
         );
@@ -320,7 +320,7 @@ fn inside_game(root: &Path, game: &Path) -> bool {
 /// as it was. `game` is the folder found; with `None` (nothing found, or only saves to import) the
 /// folders the game could be in (the last one used, Steam, GOG and Epic) are compared instead.
 fn clear_for_writing(package: &Package, game: Option<&Path>) -> Result<(), Stop> {
-    let move_it = "Move the whole nv-rs folder somewhere else, for example C:\\Games\\nv-rs, and start Play.exe again.";
+    let move_it = "Move the whole nv-rs folder somewhere else, for example C:\\Games\\nv-rs, and start Launcher.exe again.";
     let mut folders: Vec<PathBuf> = Vec::new();
     match game {
         Some(game) => folders.push(game.to_path_buf()),
@@ -422,8 +422,8 @@ fn run_limited(command: &mut Command, limit: Duration) -> Limited {
 fn exe_read_problem(exe: &Path) -> Option<String> {
     let e = std::fs::File::open(exe).err()?;
     let why = match e.raw_os_error() {
-        Some(32 | 33) => "Another program has it open: the game or its launcher still running, or an antivirus scanning it. Close them, wait a moment and start Play.exe again.",
-        Some(5) => "Windows does not let this account read it. The folder's permissions may be restrictive, or an antivirus or Windows' \"controlled folder access\" blocks it. Allow Play.exe, or give your account read access to the game's folder.",
+        Some(32 | 33) => "Another program has it open: the game or its launcher still running, or an antivirus scanning it. Close them, wait a moment and start Launcher.exe again.",
+        Some(5) => "Windows does not let this account read it. The folder's permissions may be restrictive, or an antivirus or Windows' \"controlled folder access\" blocks it. Allow Launcher.exe, or give your account read access to the game's folder.",
         _ => "Windows can't read it.",
     };
     Some(format!(
@@ -505,7 +505,7 @@ fn check_game(package: &Package, game: &Game) -> Result<Vec<String>, Stop> {
     stop(
         STOP_WRONG_GAME,
         format!(
-            "Your game is version {found}, and nv-rs needs version 1.4.0.525 (the last update, with all patches installed).\n\nUpdate the game through the store you bought it from, then start Play.exe again.\n\nGame folder:\n{}",
+            "Your game is version {found}, and nv-rs needs version 1.4.0.525 (the last update, with all patches installed).\n\nUpdate the game through the store you bought it from, then start Launcher.exe again.\n\nGame folder:\n{}",
             game.folder.display()
         ),
     )
@@ -813,7 +813,7 @@ fn prepare_files(
             return stop(
                 STOP_SETTINGS,
                 format!(
-                    "nv-rs can't read its settings ({e}). Close any program that has it open, or remove it, and start Play.exe again. The file is:\n{}",
+                    "nv-rs can't read its settings ({e}). Close any program that has it open, or remove it, and start Launcher.exe again. The file is:\n{}",
                     package.settings.display()
                 ),
             )
@@ -871,7 +871,7 @@ fn prepare_files(
     }
     if !all_seeded {
         package.log(
-            "settings.ini stays where it is: a Fallout.ini could not take its choices (said above). Settings.cmd keeps reading and writing settings.ini, and Play.exe moves it in again at the next start",
+            "settings.ini stays where it is: a Fallout.ini could not take its choices (said above). Settings.cmd keeps reading and writing settings.ini, and Launcher.exe moves it in again at the next start",
         );
         return Ok(());
     }
@@ -885,7 +885,7 @@ fn prepare_files(
             "settings.ini's choices are now in the game's Fallout.ini and FalloutPrefs.ini; the old file is {name}"
         )),
         Err(e) => package.log(&format!(
-            "settings.ini's choices are in the game's Fallout.ini and FalloutPrefs.ini, but the file could not be renamed to {name} ({e}). It stays the settings while it is there: Settings.cmd keeps reading and writing it, and Play.exe moves it in again at every start, over what the game's files say. Close whatever has it open, or remove it"
+            "settings.ini's choices are in the game's Fallout.ini and FalloutPrefs.ini, but the file could not be renamed to {name} ({e}). It stays the settings while it is there: Settings.cmd keeps reading and writing it, and Launcher.exe moves it in again at every start, over what the game's files say. Close whatever has it open, or remove it"
         )),
     }
     Ok(())
@@ -1106,7 +1106,7 @@ fn play(
     if !system.join("d3dx9_38.dll").is_file() {
         return stop(
             STOP_DIRECTX,
-            "DirectX 9's D3DX library (64-bit d3dx9_38.dll) is not on this PC. Windows doesn't include it, and nv-rs uses it for the game's shaders and textures.\n\nInstall \"DirectX End-User Runtimes (June 2010)\" from Microsoft's download site, then start Play.exe again. It is safe alongside newer DirectX.",
+            "DirectX 9's D3DX library (64-bit d3dx9_38.dll) is not on this PC. Windows doesn't include it, and nv-rs uses it for the game's shaders and textures.\n\nInstall \"DirectX End-User Runtimes (June 2010)\" from Microsoft's download site, then start Launcher.exe again. It is safe alongside newer DirectX.",
         );
     }
 
@@ -1425,7 +1425,7 @@ fn pass_switches(command: &mut Command, switches: &game_ini::Switches) -> Option
         });
     };
     Some(format!(
-        "{test} was set before Play.exe started, which makes this run a test: the game does not read Fallout.ini's nv-rs settings in a test. Passed on from the file (from settings.ini when the file has no nv-rs sections), so the game plays as the player's does: {}. Set before the start and kept as they were: {}",
+        "{test} was set before Launcher.exe started, which makes this run a test: the game does not read Fallout.ini's nv-rs settings in a test. Passed on from the file (from settings.ini when the file has no nv-rs sections), so the game plays as the player's does: {}. Set before the start and kept as they were: {}",
         list(&passed),
         list(&kept)
     ))
@@ -1436,20 +1436,21 @@ fn sound_notes(package: &Package, sound: &Path, check_lines: &[String], front: &
     let table = std::fs::read_to_string(sound).unwrap_or_default();
     if tables::sound_state(&table) == Ok(tables::Sound::NoDevice) {
         package.log("no sound device");
-        front.warning("Windows reports no sound device, so the game will start without sound.\n\nPlug in or turn on a sound device and start Play.exe again: nv-rs notices the change and reads the new device.");
+        front.warning("Windows reports no sound device, so the game will start without sound.\n\nPlug in or turn on a sound device and start Launcher.exe again: nv-rs notices the change and reads the new device.");
         return;
     }
     for line in check_lines {
         if let Some((_, why)) = line.split_once("not provided: ") {
             package.log(&format!("sound layout: {why}"));
             front.warning(&format!(
-                "The game will have no sound on your current sound device:\n{why}.\n\nIn Windows' sound settings, set the device to stereo, 5.1 or 7.1, or choose another device, then start Play.exe again."
+                "The game will have no sound on your current sound device:\n{why}.\n\nIn Windows' sound settings, set the device to stereo, 5.1 or 7.1, or choose another device, then start Launcher.exe again."
             ));
         }
     }
 }
 
-/// Once per process: the single-instance lock stays held until the process ends.
+/// The single-instance lock stays held until the process ends, so a second start in the same
+/// process (after the game ends) is not refused by it.
 pub fn launch(front: &dyn Front, root: PathBuf, args: &[String]) -> i32 {
     let options = parse_options(args);
     let package = Package::at(root);
@@ -2381,7 +2382,7 @@ mod tests {
             "NV_THREADS is not on the command: it comes through as set"
         );
         assert!(
-            line.starts_with("NV_FRAME_LOG was set before Play.exe started"),
+            line.starts_with("NV_FRAME_LOG was set before Launcher.exe started"),
             "{line}"
         );
         assert!(

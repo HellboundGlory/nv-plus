@@ -1,0 +1,415 @@
+// The launcher's home screen: frame, wasteland art, menu, patch-notes panel, status bar.
+
+import { ScrollView } from "std-widgets.slint";
+import { LoadingBar, Look, PlateButton, SquareButton, WindowButton } from "widgets.slint";
+
+export struct NoteItem {
+    title: string,
+    label: string,
+    summary: string,
+}
+
+export component LauncherWindow inherits Window {
+    in property <[NoteItem]> notes;
+    in property <string> version;
+    in property <bool> starting;
+    in property <float> progress;
+    in property <string> step;
+
+    callback play();
+    callback quit();
+    callback minimise();
+    callback website();
+
+    title: "NV+ Launcher";
+    icon: @image-url("../assets/logo-nvplus.png");
+    no-frame: true;
+    width: 1280px;
+    height: 720px;
+    background: Look.bg;
+
+    property <bool> news: false;
+    // The frame's inner edge.
+    property <length> inset: 22px;
+    property <int> percent: round(root.progress * 100);
+
+    // The window frame, its 34 px corner drawn at 22 px.
+    Image {
+        source: @image-url("../assets/frame-22.png", nine-slice(22));
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // The wasteland scene at window width from y 74, with the dark gradient over its left side.
+    Rectangle {
+        x: 22px;
+        y: 22px;
+        width: parent.width - 44px;
+        height: 676px;
+        clip: true;
+        background: Look.bg;
+
+        Image {
+            x: 0;
+            y: 74px;
+            width: parent.width;
+            height: parent.width * 583 / 1326;
+            source: @image-url("../assets/art-wasteland.png");
+            image-fit: fill;
+        }
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: @linear-gradient(90deg, #120d08 0%, #120d08 28%, #120d08e0 40%, #120d0800 62%);
+        }
+    }
+
+    // Top bar: the drag handle.
+    Rectangle {
+        x: 322px;
+        y: 22px;
+        width: parent.width - 344px;
+        height: 74px;
+        background: @linear-gradient(180deg, #2a2015 0%, #17110b 100%);
+    }
+    Rectangle {
+        x: 322px;
+        y: 94px;
+        width: parent.width - 344px;
+        height: 2px;
+        background: Look.line;
+    }
+    WindowMoveArea {
+        x: 322px;
+        y: 22px;
+        width: parent.width - 344px;
+        height: 74px;
+    }
+
+    // Slogan: the approved picture, drawn at 265 x 156.
+    Image {
+        x: parent.width - 70px - 265px;
+        y: 120px;
+        width: 265px;
+        height: 156px;
+        source: @image-url("../assets/slogan@2x.png");
+    }
+
+    // The logo, 150 x 150 centred on x 172 at y 30.
+    Image {
+        x: 172px - 75px;
+        y: 30px;
+        width: 150px;
+        height: 150px;
+        source: @image-url("../assets/logo-nvplus.png");
+    }
+
+    // The menu.
+    VerticalLayout {
+        x: 46px;
+        y: 196px;
+        width: 252px;
+        spacing: 12px;
+
+        PlateButton {
+            gold: true;
+            enabled: !root.starting;
+            text: "PLAY";
+            chevron: "M 3 3 L 16 15 L 3 27";
+            clicked => { root.play(); }
+        }
+        PlateButton {
+            text: "SETTINGS";
+        }
+        PlateButton {
+            text: "MODS";
+        }
+        PlateButton {
+            text: "EXIT";
+            enabled: !root.starting;
+            clicked => { root.quit(); }
+        }
+    }
+    // About and Website.
+    HorizontalLayout {
+        x: 52px;
+        y: 528px;
+        spacing: 12px;
+
+        SquareButton {
+            about: true;
+        }
+        SquareButton {
+            clicked => { root.website(); }
+        }
+    }
+
+    // The window buttons: minimise and close.
+    HorizontalLayout {
+        x: parent.width - 36px - 48px - 6px - 48px;
+        y: 34px;
+        spacing: 6px;
+
+        WindowButton {
+            clicked => { root.minimise(); }
+        }
+        WindowButton {
+            close: true;
+            clicked => { root.quit(); }
+        }
+    }
+
+    // The patch-notes panel.
+    Rectangle {
+        x: 322px;
+        y: 124px;
+        width: 470px;
+        height: 478px;
+
+        Image {
+            source: @image-url("../assets/panel-24.png", nine-slice(24));
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            x: 30px;
+            y: 26px;
+            width: parent.width - 60px;
+            height: parent.height - 52px;
+
+            // Header: the terminal icon, the title and the two tabs.
+            Image {
+                x: 0;
+                y: 0;
+                width: 30px;
+                height: 30px;
+                source: @image-url("../assets/icon-terminal.png");
+            }
+            Text {
+                x: 40px;
+                y: 0;
+                height: 30px;
+                vertical-alignment: center;
+                text: root.news ? "NEWS" : "PATCH NOTES";
+                color: Look.heading;
+                font-family: Look.cond;
+                font-weight: 700;
+                font-size: 28px;
+                letter-spacing: 1.12px;
+            }
+            HorizontalLayout {
+                x: parent.width - self.width;
+                y: 0;
+                width: self.preferred-width;
+                height: 30px;
+                spacing: 6px;
+
+                tab-notes := Rectangle {
+                    preferred-width: notes-text.preferred-width + 20px;
+                    height: 26px;
+                    y: 2px;
+                    border-width: 1px;
+                    border-color: Look.line;
+                    background: root.news ? transparent : Look.gold;
+
+                    notes-text := Text {
+                        width: parent.width;
+                        height: parent.height;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "PATCH NOTES";
+                        font-family: Look.cond;
+                        font-weight: 600;
+                        font-size: 15px;
+                        letter-spacing: 0.9px;
+                        color: root.news ? Look.dim : Look.ink-gold;
+                    }
+                    TouchArea {
+                        clicked => { root.news = false; }
+                    }
+                }
+                tab-news := Rectangle {
+                    preferred-width: news-text.preferred-width + 20px;
+                    height: 26px;
+                    y: 2px;
+                    border-width: 1px;
+                    border-color: Look.line;
+                    background: root.news ? Look.gold : transparent;
+
+                    news-text := Text {
+                        width: parent.width;
+                        height: parent.height;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "NEWS";
+                        font-family: Look.cond;
+                        font-weight: 600;
+                        font-size: 15px;
+                        letter-spacing: 0.9px;
+                        color: root.news ? Look.ink-gold : Look.dim;
+                    }
+                    TouchArea {
+                        clicked => { root.news = true; }
+                    }
+                }
+            }
+            Rectangle {
+                x: 0;
+                y: 38px;
+                width: parent.width;
+                height: 2px;
+                background: Look.line;
+            }
+
+            if !root.news: Rectangle {
+                y: 46px;
+                width: parent.width;
+                height: parent.height - 46px - 26px;
+                background: transparent;
+                clip: true;
+                ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    content-height: list.preferred-height;
+
+                    list := VerticalLayout {
+                        width: parent.width - 14px;
+                        spacing: 0;
+
+                        for note in root.notes: Rectangle {
+                            width: parent.width;
+                            preferred-height: item.preferred-height;
+                            background: transparent;
+
+                            item := VerticalLayout {
+                                width: parent.width;
+                                padding-top: 10px;
+                                padding-bottom: 10px;
+                                padding-left: 4px;
+                                padding-right: 4px;
+                                spacing: 0;
+
+                                HorizontalLayout {
+                                    width: parent.width;
+                                    spacing: 12px;
+
+                                    Text {
+                                        text: note.title;
+                                        color: Look.ink;
+                                        font-family: Look.cond;
+                                        font-weight: 600;
+                                        font-size: 21px;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Text {
+                                        text: note.label;
+                                        color: Look.dim;
+                                        font-family: Look.cond;
+                                        font-weight: 500;
+                                        font-size: 16px;
+                                    }
+                                }
+                                Text {
+                                    width: parent.width;
+                                    text: note.summary;
+                                    color: Look.dim;
+                                    font-family: Look.cond;
+                                    font-weight: 400;
+                                    font-size: 18px;
+                                    wrap: word-wrap;
+                                }
+                                Rectangle {
+                                    width: parent.width;
+                                    height: 1px;
+                                    background: #3a2c18;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.news: Text {
+                y: 60px;
+                width: parent.width;
+                text: "No news yet.";
+                color: Look.dim;
+                font-family: Look.cond;
+                font-weight: 400;
+                font-size: 20px;
+            }
+
+            if !root.news: Text {
+                y: parent.height - 22px;
+                width: parent.width;
+                text: "Shipped with this build.";
+                color: Look.dim;
+                opacity: 0.8;
+                font-family: Look.cond;
+                font-weight: 400;
+                font-size: 15px;
+            }
+        }
+    }
+
+    // The status bar.
+    Rectangle {
+        x: root.inset;
+        y: parent.height - root.inset - 60px;
+        width: parent.width - 2 * root.inset;
+        height: 60px;
+        background: @linear-gradient(180deg, #1d160e 0%, #0f0b07 100%);
+
+        Rectangle {
+            y: 0;
+            width: parent.width;
+            height: 2px;
+            background: Look.line;
+        }
+
+        HorizontalLayout {
+            x: 18px;
+            width: parent.width - 36px;
+            height: parent.height;
+            spacing: 16px;
+
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 8px;
+                    background: #3fbf4f;
+                }
+            }
+            Text {
+                vertical-alignment: center;
+                text: "NV+ " + root.version;
+                color: Look.dim;
+                font-family: Look.cond;
+                font-weight: 500;
+                font-size: 19px;
+            }
+            if root.starting: HorizontalLayout {
+                padding-left: 12px;
+                spacing: 14px;
+                horizontal-stretch: 1;
+
+                LoadingBar {
+                    progress: root.progress;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    text: root.step + " " + percent + "%";
+                    color: Look.dim;
+                    font-family: Look.cond;
+                    font-weight: 500;
+                    font-size: 19px;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

@@ -5,9 +5,14 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 description = "The NV+ launcher's logic: finds the player's game, makes this PC's tables, keeps every file the game writes in the package's own folder, starts the game and says plainly what went wrong. Windows only."
+build = "app/build.rs"
 
 [lib]
 name = "nv_plus_launcher"
+
+[[bin]]
+name = "Launcher"
+path = "app/main.rs"
 
 # Standalone crate, not part of the root workspace, so it keeps its own lock file.
 [workspace]
@@ -15,3 +20,10 @@ name = "nv_plus_launcher"
 [dependencies]
 # The sound table's answers as Windows gives them when this runs under Wine or Proton.
 nv-plus-game = { path = "../game" }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+[profile.release]
+strip = true

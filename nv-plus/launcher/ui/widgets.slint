@@ -1,0 +1,201 @@
+// The plates, buttons and loading bar the home screen is built from.
+
+import "../assets/fonts/BarlowCondensed-Regular.ttf";
+import "../assets/fonts/BarlowCondensed-SemiBold.ttf";
+import "../assets/fonts/BarlowCondensed-Bold.ttf";
+
+export global Look {
+    out property <color> ink: #f1d9a8;
+    out property <color> ink-gold: #1d1307;
+    out property <color> dim: #c8b48c;
+    out property <color> line: #6b5126;
+    out property <color> heading: #f3c75a;
+    out property <color> bg: #120d08;
+    out property <color> gold: #e9b23c;
+    out property <color> icon: #e6b552;
+    out property <string> cond: "Barlow Condensed";
+}
+
+// The mockup's brightness(1.18) as a white wash.
+component Hue inherits Rectangle {
+    in property <bool> on;
+    background: white;
+    opacity: 0;
+    animate opacity { duration: 120ms; }
+    states [
+        lit when root.on: {
+            opacity: 0.14;
+        }
+    ]
+}
+
+export component PlateButton inherits Rectangle {
+    in property <bool> gold: false;
+    in property <bool> enabled: true;
+    in property <string> text;
+    in property <string> chevron;
+    callback clicked();
+
+    width: 252px;
+    height: 72px;
+
+    Image {
+        source: root.gold ? @image-url("../assets/plate-gold.png") : @image-url("../assets/plate-dark.png");
+        width: parent.width;
+        height: parent.height;
+        image-fit: fill;
+    }
+    // The mockup's 2 px black drop shadow under the dark plates' lettering.
+    if !root.gold: Text {
+        x: 26px;
+        y: 2px;
+        width: parent.width - 52px;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: black;
+        font-family: Look.cond;
+        font-weight: 700;
+        font-size: 36px;
+        letter-spacing: 2.16px;
+    }
+    Text {
+        x: 26px;
+        width: parent.width - 52px;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.text;
+        color: root.gold ? Look.ink-gold : Look.ink;
+        font-family: Look.cond;
+        font-weight: 700;
+        font-size: 36px;
+        letter-spacing: 2.16px;
+    }
+    if root.chevron != "" : Path {
+        x: parent.width - 30px - 20px;
+        y: (parent.height - self.height) / 2;
+        width: 20px;
+        height: 30px;
+        viewbox-width: 20;
+        viewbox-height: 30;
+        stroke: Look.ink-gold;
+        stroke-width: 5px;
+        fill: transparent;
+        commands: root.chevron;
+    }
+    hue := Hue {
+        on: touch.has-hover && root.enabled;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    states [
+        off when !root.enabled: {
+            opacity: 0.4;
+        }
+    ]
+}
+
+// The About and Website buttons on the window-button plate.
+export component SquareButton inherits Rectangle {
+    in property <bool> about: false;
+    callback clicked();
+
+    width: 52px;
+    height: 46px;
+
+    Image {
+        source: @image-url("../assets/wb-plate.png");
+        width: parent.width;
+        height: parent.height;
+        image-fit: fill;
+    }
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 26px;
+        height: 26px;
+        viewbox-width: 26;
+        viewbox-height: 26;
+        stroke: Look.icon;
+        stroke-width: 2.6px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: root.about
+            ? "M 13 2.5 A 10.5 10.5 0 1 0 13 23.5 A 10.5 10.5 0 1 0 13 2.5 M 13 11.5 L 13 19 M 13 7.2 L 13 7.6"
+            : "M 13 2.5 A 10.5 10.5 0 1 0 13 23.5 A 10.5 10.5 0 1 0 13 2.5 M 13 2.5 A 4.6 10.5 0 1 0 13 23.5 A 4.6 10.5 0 1 0 13 2.5 M 2.5 13 L 23.5 13 M 4.5 7.5 L 21.5 7.5 M 4.5 18.5 L 21.5 18.5";
+    }
+    hue := Hue {
+        on: touch.has-hover;
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// The minimise and close plates in the top right.
+export component WindowButton inherits Rectangle {
+    in property <bool> close: false;
+    callback clicked();
+
+    width: 48px;
+    height: 41px;
+
+    Image {
+        source: @image-url("../assets/wb-plate.png");
+        width: parent.width;
+        height: parent.height;
+        image-fit: fill;
+    }
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 20px;
+        height: 20px;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        stroke: Look.icon;
+        stroke-width: 3.6px;
+        stroke-line-cap: square;
+        fill: transparent;
+        commands: root.close ? "M 4 4 L 16 16 M 16 4 L 4 16" : "M 3 15 L 17 15";
+    }
+    hue := Hue {
+        on: touch.has-hover;
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// 380 x 32 with the frame drawn at 9 px and the striped fill clipped to the progress.
+export component LoadingBar inherits Rectangle {
+    in property <float> progress: 0;
+
+    width: 380px;
+    height: 32px;
+
+    Image {
+        source: @image-url("../assets/bar-9.png", nine-slice(9));
+        width: parent.width;
+        height: parent.height;
+    }
+    fill-clip := Rectangle {
+        x: 1px;
+        y: 1px;
+        height: parent.height - 2px;
+        width: max(0px, (parent.width - 4px) * root.progress);
+        clip: true;
+
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: @image-url("../assets/stripe.png");
+            horizontal-tiling: repeat;
+            vertical-tiling: repeat;
+        }
+    }
+}

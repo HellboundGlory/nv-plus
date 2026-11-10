@@ -123,14 +123,18 @@ pub fn now() -> (String, String) {
     )
 }
 
-/// True when another copy of the launcher already runs. The mutex lives as long as this process.
+/// True when another copy of the launcher already runs. The mutex this process takes lives as long
+/// as the process, so the first answer is kept: a second start after the game ends must not find it.
 pub fn another_is_running() -> bool {
-    let name = wide_str("Local\\nv-plus-launcher");
-    // SAFETY: the name lives through the call; the handle is kept open on purpose.
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        !handle.is_null() && GetLastError() == 183
-    }
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let name = wide_str("Local\\nv-plus-launcher");
+        // SAFETY: the name lives through the call; the handle is kept open on purpose.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            !handle.is_null() && GetLastError() == 183
+        }
+    })
 }
 
 /// A folder Windows knows: `CSIDL_PERSONAL` 5 (the real Documents, wherever OneDrive moved it),
@@ -391,5 +395,16 @@ pub fn default_sound_device() -> Option<String> {
         let release: Release = std::mem::transmute(*(*device).vtable.add(2));
         release(device);
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn another_is_running_answers_the_same_every_call() {
+        assert!(!another_is_running());
+        assert!(!another_is_running());
     }
 }

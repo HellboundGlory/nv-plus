@@ -148,7 +148,7 @@ impl ModError {
             Failure::OtherDrive => "For mods nv-rs makes links to the game's files, never copies, and a link can't reach another drive. Move the nv-rs folder to the drive the game is on, or play without mods.",
             Failure::NoLinks => "For mods nv-rs makes links to the game's files, never copies, and this drive can't hold links: it needs a normal Windows (NTFS) drive. Move the nv-rs folder to an NTFS drive that the game is on, or play without mods.",
             Failure::Locked => "Another program has this file open: the game or its launcher still running, a mod manager, or an antivirus scanning it. Close it, wait a moment and try again.",
-            Failure::Denied => "Windows did not allow it: the file or folder may be read-only, or your account lacks the rights, or an antivirus or controlled folder access blocks it. Clear \"Read-only\" in its Properties, or allow Play.exe, and try again.",
+            Failure::Denied => "Windows did not allow it: the file or folder may be read-only, or your account lacks the rights, or an antivirus or controlled folder access blocks it. Clear \"Read-only\" in its Properties, or allow Launcher.exe, and try again.",
             Failure::Full => "There is no room left on the drive. Free some space, or play without mods: the links take little room, but the mods' files are copied.",
             Failure::Other => "Please report this if it keeps happening.",
         };

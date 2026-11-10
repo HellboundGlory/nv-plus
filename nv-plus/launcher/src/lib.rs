@@ -10,5 +10,7 @@ mod settings;
 mod tables;
 mod win;
 
+pub use desktop::{game_window_is_there, open_link};
 pub use front::Front;
 pub use play::launch;
+pub use win::another_is_running;
