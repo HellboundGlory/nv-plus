@@ -65,7 +65,7 @@ try {
         # machine's folders stay out of the programs.
         $registry = Join-Path $(if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }) 'registry\src'
         $rustup = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
-        $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'target-feature=+crt-static', "--remap-path-prefix=$root=nv-rs", "--remap-path-prefix=$registry=cargo", "--remap-path-prefix=$rustup=rustup") -join [char]0x1f
+        $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'target-feature=+crt-static', "--remap-path-prefix=$root=nv-rs", "--remap-path-prefix=$registry=cargo", "--remap-path-prefix=$rustup=rustup", "--remap-path-prefix=$Target=target") -join [char]0x1f
         $env:CARGO_TARGET_DIR = $Target
         cargo build --release --locked -p nv-viewer
         if ($LASTEXITCODE) { throw 'The game program did not build.' }

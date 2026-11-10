@@ -182,7 +182,7 @@ if [ "$build" = 1 ]; then
     # rebuilt with these flags.
     sep=$'\x1f'
     export CARGO_TARGET_DIR=$target
-    export CARGO_ENCODED_RUSTFLAGS="-C${sep}target-feature=+crt-static${sep}--remap-path-prefix=${repo}=nv-rs${sep}--remap-path-prefix=${cargo_home}/registry/src=cargo${sep}--remap-path-prefix=${rustup_home}=rustup"
+    export CARGO_ENCODED_RUSTFLAGS="-C${sep}target-feature=+crt-static${sep}--remap-path-prefix=${repo}=nv-rs${sep}--remap-path-prefix=${cargo_home}/registry/src=cargo${sep}--remap-path-prefix=${rustup_home}=rustup${sep}--remap-path-prefix=${target}=target"
     cargo build --release --locked --target x86_64-pc-windows-gnu -p nv-viewer
     cargo build --release --locked --target x86_64-pc-windows-gnu \
         --manifest-path nv-plus/launcher/Cargo.toml --bin Launcher
