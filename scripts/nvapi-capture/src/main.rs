@@ -125,8 +125,8 @@ fn table_ids(exe: &[u8]) -> Vec<u32> {
     }
 }
 
-/// An `IDirect3D9` and a windowed HAL device on a window of its own, as the game has them when
-/// its multi-GPU probe runs. Returns the `IDirect3D9`.
+/// An `IDirect3D9` and a windowed HAL device on a hidden window of its own, as the game has them
+/// when its multi-GPU probe runs. Returns the `IDirect3D9`.
 unsafe fn direct3d(o: &mut impl Write) -> *mut c_void {
     let instance = GetModuleHandleA(std::ptr::null());
     let name = b"nv-rs nvapi-capture\0";
@@ -143,7 +143,8 @@ unsafe fn direct3d(o: &mut impl Write) -> *mut c_void {
         class_name: name.as_ptr(),
     };
     RegisterClassA(&class);
-    let window = CreateWindowExA(0, name.as_ptr(), name.as_ptr(), 0x1000_0000, 0, 0, 320, 240,
+    // Never shown: the device only needs a window, and a shown one flashes on the player's screen.
+    let window = CreateWindowExA(0, name.as_ptr(), name.as_ptr(), 0, 0, 0, 320, 240,
         std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null_mut());
     let d3d = Direct3DCreate9(32);
     assert!(!d3d.is_null());

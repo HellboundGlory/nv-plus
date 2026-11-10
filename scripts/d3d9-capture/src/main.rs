@@ -165,13 +165,17 @@ unsafe fn windows(o: &mut impl Write) {
         class_name: name.as_ptr(),
     };
     RegisterClassA(&class);
+    // The windows are made visible, as the game's are, but off the screen so they don't flash on
+    // the player's; where a window sits doesn't change the style it reads back.
+    const OFF: i32 = -32000;
     for (requested, parent_style) in [(0x1000_0000u32, None), (0x5000_0000, Some(0x1000_0000u32))] {
         let parent = match parent_style {
-            Some(style) => CreateWindowExA(0, name.as_ptr(), name.as_ptr(), style, 0, 0, 320, 240,
+            Some(style) => CreateWindowExA(0, name.as_ptr(), name.as_ptr(), style, OFF, OFF, 320, 240,
                 std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null_mut()),
             None => std::ptr::null_mut(),
         };
-        let window = CreateWindowExA(0, name.as_ptr(), name.as_ptr(), requested, 0, 0, 320, 240,
+        let at = if parent.is_null() { OFF } else { 0 };
+        let window = CreateWindowExA(0, name.as_ptr(), name.as_ptr(), requested, at, at, 320, 240,
             parent, std::ptr::null_mut(), instance, std::ptr::null_mut());
         let style = GetWindowLongA(window, -16) as u32;
         let ex_style = GetWindowLongA(window, -20) as u32;
