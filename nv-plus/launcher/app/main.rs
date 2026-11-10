@@ -8,6 +8,9 @@ mod native;
 mod notes;
 
 use front::WindowFront;
+use slint::winit_030::winit::dpi::PhysicalSize;
+use slint::winit_030::winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+use slint::winit_030::winit::window::Icon;
 use slint::ComponentHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +66,19 @@ fn main() {
 
     if nv_plus_launcher::another_is_running() {
         dialogs::error("NV+ is already running.");
+        return;
+    }
+
+    // The big icon has to be on the window before it is first shown: Wine and Proton build the
+    // taskbar's icon from it, and KDE only picks it up when the window appears.
+    let icon = Icon::from_resource(native::ICON_GROUP, Some(PhysicalSize::new(256, 256))).ok();
+    let backend = slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(move |attributes| {
+            attributes.with_taskbar_icon(icon.clone())
+        })
+        .select();
+    if let Err(e) = backend {
+        dialogs::error(&format!("The launcher's window could not be made: {e}"));
         return;
     }
 

@@ -1,8 +1,5 @@
-// The native window's outline, its big icon, and full repaints after the system throws the
-// window's pixels away.
-//
-// Slint hands its icon to the window as the small icon only; Wine builds the taskbar's icon from
-// the big one and falls back to its own logo, so the big icon is set from Launcher.exe's resource.
+// The native window's outline, and full repaints after the system throws the window's pixels
+// away.
 //
 // The renderer redraws only what changed since its last frame, so after Wine drops a minimised
 // window's contents and asks for a repaint, nothing changed and nothing is drawn. A WM_PAINT
@@ -20,13 +17,10 @@ type WndProc = unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize;
 const GWLP_WNDPROC: i32 = -4;
 const WM_SIZE: u32 = 0x0005;
 const WM_PAINT: u32 = 0x000F;
-const WM_SETICON: u32 = 0x0080;
 const SIZE_MINIMIZED: usize = 1;
 const WINDING: i32 = 2;
-const ICON_BIG: usize = 1;
-const IMAGE_ICON: u32 = 1;
-// The icon group `app/build.rs` writes.
-const ICON_GROUP: usize = 1;
+/// The icon group `app/build.rs` writes.
+pub const ICON_GROUP: u16 = 1;
 
 #[repr(C)]
 struct Point {
@@ -51,15 +45,6 @@ extern "system" {
     fn SetWindowRgn(window: Hwnd, region: *mut c_void, redraw: i32) -> i32;
     fn SetWindowLongPtrW(window: Hwnd, index: i32, value: isize) -> isize;
     fn CallWindowProcW(previous: isize, window: Hwnd, msg: u32, w: usize, l: isize) -> isize;
-    fn SendMessageW(window: Hwnd, msg: u32, w: usize, l: isize) -> isize;
-    fn LoadImageW(
-        instance: *mut c_void,
-        name: *const u16,
-        kind: u32,
-        width: i32,
-        height: i32,
-        flags: u32,
-    ) -> *mut c_void;
 }
 
 #[link(name = "gdi32")]
@@ -67,11 +52,6 @@ extern "system" {
     fn CreatePolygonRgn(points: *const Point, count: i32, mode: i32) -> *mut c_void;
     fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
     fn DeleteObject(object: *mut c_void) -> i32;
-}
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetModuleHandleW(name: *const u16) -> *mut c_void;
 }
 
 static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
@@ -157,9 +137,8 @@ unsafe extern "system" fn proc(window: Hwnd, msg: u32, w: usize, l: isize) -> is
     CallWindowProcW(PREVIOUS.load(Ordering::SeqCst), window, msg, w, l)
 }
 
-/// Cuts the window to the frame's outline, gives it the big icon and calls `on_wiped` before each
-/// repaint the system asks for. Call on the event loop's thread; false while the native window
-/// doesn't exist yet.
+/// Cuts the window to the frame's outline and calls `on_wiped` before each repaint the system
+/// asks for. Call on the event loop's thread; false while the native window doesn't exist yet.
 pub fn fit(window: &slint::Window, on_wiped: impl Fn() + 'static) -> bool {
     if PREVIOUS.load(Ordering::SeqCst) != 0 {
         return true;
@@ -170,17 +149,6 @@ pub fn fit(window: &slint::Window, on_wiped: impl Fn() + 'static) -> bool {
     ON_WIPED.with(|f| *f.borrow_mut() = Some(Box::new(on_wiped)));
     unsafe {
         cut(handle, false);
-        let icon = LoadImageW(
-            GetModuleHandleW(std::ptr::null()),
-            ICON_GROUP as *const u16,
-            IMAGE_ICON,
-            256,
-            256,
-            0,
-        );
-        if !icon.is_null() {
-            SendMessageW(handle, WM_SETICON, ICON_BIG, icon as isize);
-        }
         let ours: WndProc = proc;
         PREVIOUS.store(
             SetWindowLongPtrW(handle, GWLP_WNDPROC, ours as usize as isize),

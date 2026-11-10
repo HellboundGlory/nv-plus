@@ -20,7 +20,7 @@ path = "app/main.rs"
 [dependencies]
 # The sound table's answers as Windows gives them when this runs under Wine or Proton.
 nv-plus-game = { path = "../game" }
-slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "raw-window-handle-06", "unstable-winit-030"] }
 raw-window-handle = "=0.6.2"
 
 [build-dependencies]
