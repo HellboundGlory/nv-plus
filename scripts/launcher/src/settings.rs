@@ -1,9 +1,8 @@
-//! `userdata\settings.ini`, which Settings.cmd writes and the launcher reads: `Name=Value` lines.
-//! Names the launcher doesn't know are kept by Settings.cmd and ignored here, so a new setting can
-//! join without a new launcher. A name starting with `NV_` goes to the game's environment as it is
-//! (but the launcher's own switches: `main.rs`'s `OWN_SWITCHES`), which is how a switch of the
-//! game's own can join Settings later. `Preset`, `FrameLimit` and `MenuFrameLimit` become the game's
-//! `NV_PRESET`, `NV_FRAME_LIMIT` and `NV_MENU_FRAME_LIMIT` ([`Settings::game_switches`]).
+//! `userdata\settings.ini`: `Name=Value` lines Settings.cmd wrote before the player's options
+//! moved into the game's `Fallout.ini` (and wrote until Play.exe's first start). Play.exe moves
+//! it into the profiles' files once (`game_ini.rs`) and renames it `settings.ini.migrated`.
+//! `Preset`, `FrameLimit` and `MenuFrameLimit` are checked as the game would read them
+//! ([`Settings::game_switches`]); names the launcher doesn't know are passed over.
 use std::collections::BTreeMap;
 
 /// Menus' frames a second at most with no `MenuFrameLimit=` line: the game's default.
@@ -37,15 +36,20 @@ pub fn decode(bytes: &[u8]) -> String {
 }
 
 /// The value of `key` in `section` of an INI text, found as the game finds it (host
-/// `game_ini::value`): names compared without case, spaces trimmed, one pair of quotes taken off,
-/// the first match wins; a `;` line never matches.
+/// `game_ini::value`): only in the first section of that name (Windows reads no later one,
+/// measured), names compared without case, spaces trimmed, one pair of quotes taken off, the
+/// first match wins; a `;` line never matches.
 pub fn ini_value<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str> {
     let mut inside = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix('[') {
+            // The first section of the name ends here.
+            if inside {
+                return None;
+            }
             let name = rest.split(']').next().unwrap_or(rest);
-            inside = name.trim().eq_ignore_ascii_case(section);
+            inside = name.trim().eq_ignore_ascii_case(section.trim());
             continue;
         }
         let Some((name, value)) = line.split_once('=').filter(|_| inside) else {
@@ -62,82 +66,6 @@ pub fn ini_value<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str>
         }
     }
     None
-}
-
-/// The variables that make the game's run a test (host `fixes.rs`: `TEST_VARIABLES` and each
-/// fix's own variable; a host test keeps the two lists alike). In such a run the game never reads
-/// Fallout.ini's `[nv-rs ...]` keys, so the launcher doesn't pass them on either.
-pub const TEST_SWITCHES: &[&str] = &[
-    "NV_TRACE_LIST",
-    "NV_MOVE_KEYS",
-    "NV_MOVE_MOUSE",
-    "NV_MOVE_REAL_INPUT",
-    "NV_MOVE_TRACE",
-    "NV_MOVE_PROBE",
-    "NV_MOVE_TSV",
-    "NV_MOVE_WATCH",
-    "NV_MOVE_CALL_PROFILE",
-    "NV_MOVE_CALL_BUDGET",
-    "NV_MOVE_BUDGET_FROM",
-    "NV_SOUND_RECORD",
-    "NV_REPEATABLE",
-    "NV_SHOT",
-    "NV_FRAME_LOG",
-    "NV_LOCK_STATS",
-    "NV_REAL_DUMP",
-    "NV_PHYS_BLEND_LOG",
-    "NV_BENCH_CALLS",
-    "NV_BENCH_CALL_COUNTS",
-    "NV_PROFILE",
-    "NV_WATCH",
-    "NV_WORD_CHECK",
-    "NV_SKIN_CHECK",
-    "NV_QUEUE_CHECK",
-    "NV_FACE_CHECK",
-    "NV_SPEECH_CHECK",
-    "NV_LIGHT_CHECK",
-    "NV_HKMEM_CHECK",
-    "NV_HEAD_CHECK",
-    "NV_BLOCK_CHECK",
-    "NV_CENSUS",
-    "NV_TOUCH",
-    "NV_PROFILE_THREAD_CALLS",
-    "NV_AUDIO_CHECK",
-    "NV_PASS_CHECK",
-    "NV_TOPIC_INDEX_CHECK",
-    "NV_NVSE_EVENT_LOG",
-    "NV_UNCAP",
-    "NV_HF_LANDING",
-    "NV_HF_SLOWMO",
-    "NV_MENU_CAP",
-    "NV_GRAB_PUSH",
-    "NV_PHYS_BLEND",
-    "NV_MOD_WORN",
-    "NV_TOPIC_INDEX",
-    "NV_SHADER_WARM",
-    "NV_IO_WAIT",
-    "NV_COSAVE_KEEP",
-    "NV_NVSE_ERROR_GUARD",
-    "NV_NVSE_IMOD_CHECK",
-    "NV_NVSE_INVREF_CHECK",
-    "NV_NVSE_SIZE_CAPS",
-    "NV_NVSE_NULL_GUARD",
-    "NV_NVSE_CYCLE_GUARD",
-    "NV_NVSE_LIST_GUARD",
-];
-
-/// Whether the game will run as a test: one of [`TEST_SWITCHES`] among the variables it gets
-/// (`passed`, names compared without case, as Windows does) or in the launcher's own environment
-/// (`inherited`), which it gets too.
-pub fn makes_a_test<'a>(
-    mut passed: impl Iterator<Item = &'a str>,
-    inherited: impl Fn(&str) -> bool,
-) -> bool {
-    passed.any(|name| {
-        TEST_SWITCHES
-            .iter()
-            .any(|test| test.eq_ignore_ascii_case(name))
-    }) || TEST_SWITCHES.iter().any(|name| inherited(name))
 }
 
 /// The file's settings.
@@ -166,9 +94,14 @@ impl Settings {
         self.0.get(name).map_or("", String::as_str)
     }
 
-    /// Borderless window: on unless the file says otherwise (the way the game has been played most).
-    pub fn borderless(&self) -> bool {
-        self.get("Borderless") != "0"
+    /// The `Borderless=` line's choice: `0` is the window as the game makes it, anything else the
+    /// borderless window. `None` with no line or an empty one: nothing was chosen here.
+    pub fn borderless(&self) -> Option<bool> {
+        match self.get_any_case("Borderless").map(str::trim) {
+            None | Some("") => None,
+            Some("0") => Some(false),
+            Some(_) => Some(true),
+        }
     }
 
     /// A setting by its name compared without case, as the game reads `Preset` and `FrameLimit`.
@@ -182,9 +115,8 @@ impl Settings {
     /// The game's fixes preset and frame limits as its switches, `NV_PRESET` (`fixes` or `vanilla`),
     /// `NV_FRAME_LIMIT` and `NV_MENU_FRAME_LIMIT` (frames a second, 0 for no limit), from
     /// `Preset=`, `FrameLimit=` and `MenuFrameLimit=`: the fixes, no limit and menus at 120 (the
-    /// game's own default, host `fixes.rs`) when a line is missing or empty. Always both, so a test switch in the
-    /// file or the launcher's own environment can't turn the player's game to vanilla unasked. A
-    /// value the game wouldn't take is an error the player reads, never a silent default.
+    /// game's own default, host `fixes.rs`) when a line is missing or empty. A value the game
+    /// wouldn't take is an error the player reads, never a silent default.
     pub fn game_switches(&self) -> Result<[(&'static str, String); 3], String> {
         let preset = match self.get_any_case("Preset").map(str::trim) {
             None | Some("") => "fixes".to_string(),
@@ -211,70 +143,16 @@ impl Settings {
         ])
     }
 
-    /// The player switches the run's `Fallout.ini` sets in its `[nv-rs ...]` sections (host
-    /// `game_ini.rs`), which win over this file's: `Some(value)` to pass, `None` to leave the
-    /// variable out (the game's own default). A key that is missing, empty or not a value the
-    /// game takes leaves this file's switch as it is.
-    pub fn file_switches(fallout_ini: &str) -> Vec<(&'static str, Option<String>)> {
-        let get = |section: &str, key: &str| {
-            ini_value(fallout_ini, section, key).filter(|v| !v.is_empty())
-        };
-        let flag = |section: &str, key: &str| match get(section, key) {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        };
-        let number = |key: &str| {
-            get("nv-rs Display", key).and_then(|v| v.parse::<u32>().ok().map(|n| n.to_string()))
-        };
-        let mut out = Vec::new();
-        match get("nv-rs General", "sPreset") {
-            Some(v) if v.eq_ignore_ascii_case("fixes") || v.eq_ignore_ascii_case("vanilla") => {
-                out.push(("NV_PRESET", Some(v.to_ascii_lowercase())));
-            }
-            _ => {}
-        }
-        if let Some(n) = number("iFrameLimit") {
-            out.push(("NV_FRAME_LIMIT", Some(n)));
-        }
-        if let Some(n) = number("iMenuFrameLimit") {
-            out.push(("NV_MENU_FRAME_LIMIT", Some(n)));
-        }
-        if let Some(on) = flag("nv-rs Display", "bBorderless") {
-            out.push(("NV_BORDERLESS", on.then(|| "1".to_string())));
-        }
-        if let Some(stepped) = flag("nv-rs Threads", "bSteppedThreads") {
-            out.push(("NV_THREADS", stepped.then(|| "stepped".to_string())));
-        }
-        if let Some(on) = flag("nv-rs Threads", "bRenderThread") {
-            out.push((
-                "NV_RENDER_THREAD",
-                Some(if on { "1" } else { "0" }.to_string()),
-            ));
-        }
-        out
-    }
-
-    /// The game's environment switches from the file (`NV_...=...`).
-    pub fn environment(&self) -> Vec<(&str, &str)> {
-        self.0
-            .iter()
-            .filter(|(k, _)| k.starts_with("NV_"))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-
-    /// The `FalloutPrefs.ini` lines these settings set, by the game's own names; `desktop` is the
-    /// primary monitor's size, used when no resolution was chosen and the prefs have none.
+    /// The `FalloutPrefs.ini` lines these settings set, by the game's own names: resolution,
+    /// anti-aliasing and anisotropic filtering. The borderless window's `bFull Screen=0` is not
+    /// among them: Play.exe sets it at every start from what the profile's `Fallout.ini` says
+    /// once these settings are in it (`prepare_profile`), so the two can't disagree.
     pub fn prefs_lines(&self) -> Vec<(String, String)> {
         let mut set = Vec::new();
         let times = |v: &str| match v {
             "Off" => Some(0u32),
             v => v.strip_suffix('x').and_then(|n| n.parse().ok()),
         };
-        if self.borderless() {
-            set.push(("bFull Screen".into(), "0".into()));
-        }
         if let Some((w, h)) = self.get("Resolution").split_once('x') {
             if w.parse::<u32>().is_ok() && h.parse::<u32>().is_ok() {
                 set.push(("iSize W".into(), w.into()));
@@ -287,63 +165,20 @@ impl Settings {
         if let Some(n) = times(self.get("Anisotropy")) {
             set.push(("iMaxAnisotropy".into(), n.to_string()));
         }
-        match self.get("VSync") {
-            "On" => set.push(("iPresentInterval".into(), "1".into())),
-            "Off" => set.push(("iPresentInterval".into(), "0".into())),
-            _ => {}
-        }
         set
     }
 }
 
-/// `prefs` (a `FalloutPrefs.ini`) with these lines set: each replaced where its name stands, and
-/// those it doesn't have added to `[Display]` (the section made when missing). Line ends stay.
+/// `prefs` (a `FalloutPrefs.ini`) with these lines set in its `[Display]` section, where the game
+/// reads them, one at a time by [`crate::game_ini::set_key`]: the same rule as every other writer
+/// of Play.exe and Settings.cmd, and as Windows' own (measured, measure/ini/repeated-sections.md):
+/// only the first `[Display]` of the file, names compared without case, so a later `[Display]`
+/// the game never reads is left as it is. A missing key goes under the first `[Display]`; a
+/// missing section is added at the end. Every other byte stays, line ends included.
 pub fn apply_to_prefs(prefs: &str, lines: &[(String, String)]) -> String {
-    let mut missing: Vec<&(String, String)> = lines.iter().collect();
-    let mut out = String::with_capacity(prefs.len() + 64);
-    for line in prefs.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\r', '\n']);
-        let end = &line[body.len()..];
-        let set = body
-            .split_once('=')
-            .and_then(|(name, _)| lines.iter().find(|(n, _)| n == name));
-        match set {
-            Some((name, value)) => {
-                out.push_str(name);
-                out.push('=');
-                out.push_str(value);
-                out.push_str(end);
-                missing.retain(|(n, _)| n != name);
-            }
-            None => out.push_str(line),
-        }
-    }
-    if missing.is_empty() {
-        return out;
-    }
-    let mut added = String::new();
-    for (name, value) in &missing {
-        added.push_str(name);
-        added.push('=');
-        added.push_str(value);
-        added.push_str("\r\n");
-    }
-    if let Some(at) = out.find("[Display]") {
-        let after = out[at..].find('\n').map_or(out.len(), |n| at + n + 1);
-        if after == out.len() && !out.ends_with('\n') {
-            out.push_str("\r\n");
-            out.push_str(&added);
-        } else {
-            out.insert_str(after, &added);
-        }
-    } else {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str("\r\n");
-        }
-        out.push_str("[Display]\r\n");
-        out.push_str(&added);
-    }
-    out
+    lines.iter().fold(prefs.to_string(), |text, (name, value)| {
+        crate::game_ini::set_key(&text, "Display", name, value)
+    })
 }
 
 #[cfg(test)]
@@ -356,74 +191,75 @@ mod tests {
             .collect()
     }
 
-    /// Fallout.ini's [nv-rs ...] keys become the switches that win over settings.ini's; a commented,
-    /// empty or unusable key leaves settings.ini's.
     #[test]
-    fn fallout_inis_keys_win_over_settings_ini() {
-        let ini = "[General]\nsPreset=vanilla\n[nv-rs General]\nsPreset=Vanilla\n\
-                   [nv-rs Display]\nbBorderless=0\niFrameLimit=fast\n;iMenuFrameLimit=60\n\
-                   [nv-rs Threads]\nbSteppedThreads=1\nbRenderThread=0\n";
-        let some = |v: &str| Some(v.to_string());
-        assert_eq!(
-            Settings::file_switches(ini),
-            [
-                ("NV_PRESET", some("vanilla")),
-                ("NV_BORDERLESS", None),
-                ("NV_THREADS", some("stepped")),
-                ("NV_RENDER_THREAD", some("0")),
-            ]
-        );
-        let ini = "[nv-rs Display]\nbBorderless=1\niFrameLimit=90\niMenuFrameLimit=0\n\
-                   [nv-rs Threads]\nbSteppedThreads=0\n";
-        assert_eq!(
-            Settings::file_switches(ini),
-            [
-                ("NV_FRAME_LIMIT", some("90")),
-                ("NV_MENU_FRAME_LIMIT", some("0")),
-                ("NV_BORDERLESS", some("1")),
-                ("NV_THREADS", None),
-            ]
-        );
-        assert!(Settings::file_switches("[General]\nsLanguage=ENGLISH\n").is_empty());
-        // A settings.ini line or an inherited variable that makes the run a test: the game
-        // won't read the file, so the launcher passes none of it.
-        let none = |_: &str| false;
-        assert!(makes_a_test(["NV_THREADS", "nv_uncap"].into_iter(), none));
-        assert!(makes_a_test(std::iter::empty(), |n| n == "NV_TRACE_LIST"));
-        assert!(!makes_a_test(
-            ["NV_THREADS", "NV_RENDER_THREAD", "NV_SAVE_OUT"].into_iter(),
-            none
-        ));
-        assert_eq!(
-            ini_value(
-                " [ NV-RS display ]\n IFRAMELIMIT = \"5\" \n",
-                "nv-rs Display",
-                "iFrameLimit"
-            ),
-            Some("5")
-        );
+    fn a_key_is_found_as_the_game_finds_it() {
+        let ini =
+            " [ NV-RS display ]\n ;iFrameLimit=9\n IFRAMELIMIT = \"5\" \n[Other]\niFrameLimit=7\n";
+        assert_eq!(ini_value(ini, "nv-rs Display", "iFrameLimit"), Some("5"));
+        assert_eq!(ini_value(ini, "Other", "iFrameLimit"), Some("7"));
+        assert_eq!(ini_value(ini, "nv-rs Display", "bBorderless"), None);
+        // A repeated section name: only the first section counts, as Windows reads it
+        // (measure/ini/repeated-sections.md); an empty first one hides the later one too.
+        let ini = "[A]\r\nx=1\r\n[B]\r\nz=3\r\n[a]\r\ny=2\r\nx=9\r\n[ A ]\r\nw=6\r\n";
+        assert_eq!(ini_value(ini, "A", "x"), Some("1"));
+        assert_eq!(ini_value(ini, "A", "y"), None);
+        assert_eq!(ini_value(ini, "A", "w"), None);
+        assert_eq!(ini_value(ini, " A ", "x"), Some("1"));
+        assert_eq!(ini_value("[A]\r\n[A]\r\nx=1\r\n", "A", "x"), None);
+        assert_eq!(ini_value("[A]\r\nx=\r\n[A]\r\nx=1\r\n", "A", "x"), Some(""));
+    }
+
+    /// Three more of Windows' answers (measure/ini/repeated-sections.md, scratch files): a key
+    /// repeated in one section gives its first line, whatever the case and spaces; a heading is
+    /// the text up to its first `]` (text after it, or no `]` at all, changes nothing, and
+    /// `[A]x=9` is a heading, not a key); a key before any heading is in no section, and `[]` is a
+    /// section named "".
+    #[test]
+    fn repeated_keys_headings_and_keys_before_any_section_read_as_windows_does() {
+        assert_eq!(ini_value("[A]\r\nx=1\r\nx=2\r\n", "A", "x"), Some("1"));
+        assert_eq!(ini_value("[A]\r\nx=1\r\n X =2\r\n", "A", "x"), Some("1"));
+        assert_eq!(ini_value("[A]\r\nX=1\r\nx=2\r\n", "A", "x"), Some("1"));
+        for text in [
+            "[A] trailing\r\nx=1\r\n",
+            "[A]; note\r\nx=1\r\n",
+            "[A]]\r\nx=1\r\n",
+            "[A\r\nx=1\r\n",
+            "[A]x=9\r\nx=1\r\n",
+            " [A] \r\nx=1\r\n",
+        ] {
+            assert_eq!(ini_value(text, "A", "x"), Some("1"), "{text:?}");
+        }
+        assert_eq!(ini_value("[A]]\r\nx=1\r\n", "A]", "x"), None);
+        assert_eq!(ini_value("x=1\r\n[A]\r\ny=2\r\n", "", "x"), None);
+        assert_eq!(ini_value("x=1\r\n[A]\r\ny=2\r\n", "A", "x"), None);
+        assert_eq!(ini_value("x=1\r\n[]\r\nz=3\r\n", "", "z"), Some("3"));
+        assert_eq!(ini_value("x=1\r\n[]\r\nz=3\r\n", "", "x"), None);
     }
 
     #[test]
     fn the_file_is_read_and_unknown_names_do_no_harm() {
+        // V-sync is not a FalloutPrefs.ini line: the game reads iPresentInterval from Fallout.ini.
         let s = Settings::parse(
-            "# a comment\nBorderless=1\nResolution=2560x1440\nAntiAliasing=8x\nAnisotropy=Off\nVSync=Game launcher's\nSomethingNew=7\nNV_FIXES=vnv\n",
+            "# a comment\nBorderless=1\nResolution=2560x1440\nAntiAliasing=8x\nAnisotropy=Off\nVSync=On\nSomethingNew=7\nNV_FIXES=vnv\n",
         );
-        assert!(s.borderless());
+        assert_eq!(s.borderless(), Some(true));
+        // The borderless window's bFull Screen=0 is not set from here: Play.exe sets it from the
+        // profile's Fallout.ini.
         assert_eq!(
             s.prefs_lines(),
             lines(&[
-                ("bFull Screen", "0"),
                 ("iSize W", "2560"),
                 ("iSize H", "1440"),
                 ("iMultiSample", "8"),
                 ("iMaxAnisotropy", "0"),
             ])
         );
-        assert_eq!(s.environment(), [("NV_FIXES", "vnv")]);
-        assert!(Settings::parse("").borderless());
-        assert!(!Settings::parse("Borderless=0").borderless());
-        assert!(Settings::parse("Borderless=0\nResolution=Game launcher's")
+        // No Borderless line, or an empty one, chooses nothing.
+        assert_eq!(Settings::parse("").borderless(), None);
+        assert_eq!(Settings::parse("Borderless=\n").borderless(), None);
+        assert_eq!(Settings::parse("borderless = 0").borderless(), Some(false));
+        assert_eq!(Settings::parse("Borderless=yes").borderless(), Some(true));
+        assert!(Settings::parse("Borderless=1\nResolution=Game launcher's")
             .prefs_lines()
             .is_empty());
     }
@@ -530,8 +366,43 @@ mod tests {
         );
         let out = apply_to_prefs("", &lines(&[("iSize H", "600")]));
         assert_eq!(out, "[Display]\r\niSize H=600\r\n");
+        // A missing section in the file's own line ends.
         let out = apply_to_prefs("[Audio]\nfVolume=1", &lines(&[("iSize H", "600")]));
-        assert_eq!(out, "[Audio]\nfVolume=1\r\n[Display]\r\niSize H=600\r\n");
+        assert_eq!(out, "[Audio]\nfVolume=1\n[Display]\niSize H=600\n");
+    }
+
+    /// A FalloutPrefs.ini with a repeated `[Display]`: the game reads only the first (Windows,
+    /// measured), so Play.exe's resolution, anti-aliasing, `bFull Screen` and `sD3DDevice` go
+    /// there, and the later section, which the game never reads, stays byte for byte. A key of
+    /// another section with the same name is not touched; names match without case.
+    #[test]
+    fn prefs_lines_go_into_the_first_display_section() {
+        let prefs = "[Display]\r\nisize w=800\r\n[Audio]\r\niSize W=5\r\n[Display]\r\niSize W=640\r\niMultiSample=8\r\nbFull Screen=1\r\n";
+        let out = apply_to_prefs(
+            prefs,
+            &lines(&[
+                ("iSize W", "1920"),
+                ("iMultiSample", "4"),
+                ("bFull Screen", "0"),
+                ("sD3DDevice", "\"Test Card\""),
+            ]),
+        );
+        let later = "[Display]\r\niSize W=640\r\niMultiSample=8\r\nbFull Screen=1\r\n";
+        assert!(
+            out.ends_with(&format!("[Audio]\r\niSize W=5\r\n{later}")),
+            "{out}"
+        );
+        let first = &out[..out.find("[Audio]").unwrap()];
+        assert!(first.starts_with("[Display]\r\n") && first.contains("isize w=1920\r\n"));
+        for line in [
+            "iMultiSample=4\r\n",
+            "bFull Screen=0\r\n",
+            "sD3DDevice=\"Test Card\"\r\n",
+        ] {
+            assert!(first.contains(line), "{line} in {first}");
+        }
+        assert_eq!(ini_value(&out, "Display", "iMultiSample"), Some("4"));
+        assert_eq!(ini_value(&out, "Display", "bFull Screen"), Some("0"));
     }
 
     #[test]

@@ -52,7 +52,7 @@ const LIST_NODE_SIZE: u32 = 8;
 const ACTOR_EQUIP_ITEM: u32 = 0x0088_c650;
 const ACTOR_UNEQUIP_ITEM: u32 = 0x0088_c790;
 const REFR_REMOVE_ITEM: u32 = 0x17c;
-const IS_ACTOR: u32 = 0x100;
+use crate::vtable::IS_ACTOR;
 const FORM_TYPE_AMMO: u8 = 0x29;
 
 /// `InventoryReference::Data`: the item, its changes entry and its extra data list.
@@ -112,11 +112,16 @@ impl Default for State {
     }
 }
 
-/// The fixes preset's row "Inventory reference checks" (docs/FIXES.md), where xNVSE frees, reads
-/// or keeps memory it should not: an unworn stack's removal ([`remove_from_container`]) takes the
-/// list out of the container's own entry before freeing it; a sale ends with its event
-/// (`crate::call_sites`); a base container entry without a form is passed over
-/// ([`inventory_items`]). Off (vanilla), each is xNVSE's.
+/// The fixes preset's row "Script reference checks" (docs/FIXES.md; once "Inventory reference
+/// checks", whose variable and Fallout.ini key it keeps): a reference handed to a script with parts
+/// missing, or xNVSE freeing or keeping memory it should not. An unworn stack's removal
+/// ([`remove_from_container`]) takes the list out of the container's own entry before freeing it;
+/// a sale ends with its event (`crate::call_sites`); a base container entry without a form is
+/// passed over ([`inventory_items`]) or, in the lookups by id of `commands/inventory_info.rs`,
+/// taken as another item; a reference with no base form or no cell, and a door whose teleport or
+/// lock has no data or whose teleport has no linked door, answer 0 or refuse in the reference
+/// commands that read or write through them (`commands/misc_ref.rs`). Off (vanilla), each is
+/// xNVSE's.
 pub fn set_checks(e: &mut Engine, on: bool) {
     state(e).checks = on;
 }
@@ -938,6 +943,15 @@ fn changes_add(e: &mut Engine, changes: u32, item: u32, list: u32) -> (u32, u32)
         e.mem.set_u32(entry + ENTRY_TYPE, item);
         list_append(e, entries, entry);
     }
+    (entry_add(e, entry, list), entry)
+}
+
+// Translated from xNVSE 6.4.9 (xNVSE/NVSE at 0ccd23a), GameExtraData.cpp: EntryData::Add,
+// ExtraContainerChangesExtendDataListCreate.
+/// Adds the extra data list `list` to a changes entry: at the end of its lists (a new list of
+/// lists when it has none), its count raised by the list's count (1 without one). Answers the
+/// entry's lists.
+pub fn entry_add(e: &mut Engine, entry: u32, list: u32) -> u32 {
     let mut extend = e.mem.u32(entry + ENTRY_EXTEND_DATA);
     if extend != 0 {
         list_append(e, extend, list);
@@ -955,7 +969,7 @@ fn changes_add(e: &mut Engine, changes: u32, item: u32, list: u32) -> (u32, u32)
     let delta = e.mem.u32(entry + ENTRY_COUNT_DELTA) as i32;
     e.mem
         .set_u32(entry + ENTRY_COUNT_DELTA, delta.wrapping_add(added) as u32);
-    (extend, entry)
+    extend
 }
 
 // Translated from xNVSE 6.4.9 (xNVSE/NVSE at 0ccd23a), InventoryReference.cpp: SetEquipped.

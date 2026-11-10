@@ -18,8 +18,9 @@
 use crate::fixes::{Preset, FIXES};
 use std::path::{Path, PathBuf};
 
-/// The table of our keys: section, key, environment variable, the generated file's value, and
-/// the comment line above it (`scripts/game-ini-sections.sh` writes the file from it).
+/// The table of our keys: section, key, environment variable, the generated file's value (the
+/// built-in default of a play run), and the comment line above it
+/// (`scripts/game-ini-sections.sh` writes the file from it).
 pub const TABLE: &str = include_str!("../data/game_ini.tsv");
 
 /// The section of the fix rows: each key turns one row of `crate::fixes::FIXES` on or off.
@@ -58,16 +59,21 @@ pub fn rows() -> Vec<Row> {
 }
 
 /// The value of `key` in `section` of the INI `text`, as the game's `GetPrivateProfileStringA`
-/// finds it (`engine_platform::ini`'s reader): every section of that name is looked in, names
-/// compared without case, spaces around names and values trimmed, one pair of surrounding quotes
-/// taken off; the first match wins. A `;` line never matches.
+/// finds it (`engine_platform::ini`'s reader): only in the first section of that name (a later
+/// section of the same name is not read, as Windows measured: measure/ini/repeated-sections.md),
+/// names compared without case, spaces around names and values trimmed, one pair of surrounding
+/// quotes taken off; the first match wins. A `;` line never matches.
 pub fn value<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str> {
     let mut inside = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix('[') {
+            // The first section of the name ends here: no later one is read.
+            if inside {
+                return None;
+            }
             let name = rest.split(']').next().unwrap_or(rest);
-            inside = name.trim().eq_ignore_ascii_case(section);
+            inside = name.trim().eq_ignore_ascii_case(section.trim());
             continue;
         }
         if !inside {
@@ -282,12 +288,13 @@ mod tests {
         );
     }
 
-    /// The table's values are the built-in defaults, so the generated file changes nothing.
+    /// The table's values are the built-in defaults of a play run (the only run that reads the
+    /// file), so the generated file changes nothing.
     #[test]
     fn the_tables_values_are_the_built_in_defaults() {
         let keys = Keys::read(&generated());
         assert_eq!(keys.preset, Some(Preset::Fixes));
-        assert_eq!(keys.borderless, Some(false));
+        assert_eq!(keys.borderless, Some(crate::fixes::PLAY_BORDERLESS));
         assert_eq!(keys.frame_limit, Some(0));
         assert_eq!(
             keys.menu_frame_limit,
@@ -358,10 +365,54 @@ mod tests {
         let text = "[nv-rs Display]\n;iFrameLimit=30\n  IFRAMELIMIT = \"60\" \niFrameLimit=90\n\
                     [General]\niFrameLimit=10\n[ NV-RS display ]\nbBorderless=1\n";
         assert_eq!(value(text, "nv-rs Display", "iFrameLimit"), Some("60"));
-        assert_eq!(value(text, "nv-rs Display", "bBorderless"), Some("1"));
+        // Only the first section of a name counts (Windows, measured 2026-11-09): the key in the
+        // later `[ NV-RS display ]` is not read.
+        assert_eq!(value(text, "nv-rs Display", "bBorderless"), None);
         assert_eq!(value(text, "General", "iFrameLimit"), Some("10"));
         assert_eq!(value(text, "nv-rs Display", ";iFrameLimit"), Some("30"));
         assert_eq!(value(text, "nv-rs Threads", "iFrameLimit"), None);
+    }
+
+    /// Three more of Windows' answers (measure/ini/repeated-sections.md, scratch files): a key
+    /// repeated in one section gives its first line; a heading is the text up to its first `]`
+    /// (text after it or no `]` changes nothing; `[A]x=9` is a heading); a key before any heading
+    /// is in no section, and `[]` is a section named "".
+    #[test]
+    fn repeated_keys_headings_and_keys_before_any_section_read_as_windows_does() {
+        assert_eq!(value("[A]\r\nx=1\r\nx=2\r\n", "A", "x"), Some("1"));
+        assert_eq!(value("[A]\r\nX=1\r\n x =2\r\n", "A", "x"), Some("1"));
+        for text in [
+            "[A] trailing\r\nx=1\r\n",
+            "[A]; note\r\nx=1\r\n",
+            "[A]]\r\nx=1\r\n",
+            "[A\r\nx=1\r\n",
+            "[A]x=9\r\nx=1\r\n",
+        ] {
+            assert_eq!(value(text, "A", "x"), Some("1"), "{text:?}");
+        }
+        assert_eq!(value("[A]]\r\nx=1\r\n", "A]", "x"), None);
+        assert_eq!(value("x=1\r\n[A]\r\ny=2\r\n", "", "x"), None);
+        assert_eq!(value("x=1\r\n[A]\r\ny=2\r\n", "A", "x"), None);
+        assert_eq!(value("x=1\r\n[]\r\nz=3\r\n", "", "z"), Some("3"));
+    }
+
+    /// Windows' answers on a file with a repeated section name (measure/ini/repeated-sections.md,
+    /// scratch files, 2026-11-09): the first section of the name only, case and the spaces in the
+    /// brackets aside; an empty first section hides a later one too.
+    #[test]
+    fn only_the_first_section_of_a_name_is_read() {
+        let text = "[A]\r\nx=1\r\n[B]\r\nz=3\r\n[a]\r\ny=2\r\nx=9\r\n[ A ]\r\nw=6\r\n";
+        assert_eq!(value(text, "A", "x"), Some("1"));
+        assert_eq!(value(text, "A", "y"), None);
+        assert_eq!(value(text, "A", "w"), None);
+        assert_eq!(value(text, "B", "z"), Some("3"));
+        assert_eq!(value(text, " A ", "x"), Some("1"));
+        let text = "[a]\r\nx=1\r\n[A]\r\ny=2\r\n[C]\r\nq=1\r\n[C]\r\nq=2\r\nr=3\r\n";
+        assert_eq!(value(text, "A", "x"), Some("1"));
+        assert_eq!(value(text, "A", "y"), None);
+        assert_eq!(value(text, "C", "q"), Some("1"));
+        assert_eq!(value(text, "C", "r"), None);
+        assert_eq!(value("[A]\r\n[A]\r\nx=1\r\n", "A", "x"), None);
     }
 
     /// Unknown keys, original keys and notes are passed over; a value we can't use leaves the

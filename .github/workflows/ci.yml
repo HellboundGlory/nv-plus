@@ -6,7 +6,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A pull request's newer push cancels its older run. On main every commit keeps its own run to
+  # the end (its group is the commit): merges there come closer together than the hour a run
+  # takes, and cancelling the run in progress left main without a finished run for hours, so a
+  # failing test went unseen (2026-11-09).
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 jobs:
   check:
@@ -53,4 +57,18 @@ jobs:
       - name: Test the ledger
         run: |
           cargo test --locked --manifest-path scripts/ledger/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      # Play.exe is its own workspace too, so the workspace steps above never build it. Its tests
+      # run distribution/Settings.ps1 in Windows PowerShell on made-up files in scratch folders.
+      # It runs and reports even when an earlier step failed; its own tests end a PowerShell
+      # that hangs after 2 minutes, and the step as a whole has its limit.
+      - name: Test the launcher (Play.exe and Settings.cmd)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          cargo fmt --manifest-path scripts/launcher/Cargo.toml -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path scripts/launcher/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --locked --manifest-path scripts/launcher/Cargo.toml --all-targets -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

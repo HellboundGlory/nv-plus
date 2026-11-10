@@ -30,12 +30,19 @@ impl TrimSpaces for [u8] {
 
 /// The value of `key` in section `section` of the INI text `text` (names compared without case,
 /// spaces around names and values trimmed, one pair of surrounding quotes taken off), as
-/// `GetPrivateProfileStringA` finds it.
+/// `GetPrivateProfileStringA` finds it: only in the first section of that name, as Windows reads
+/// a file with a repeated section name (measured on scratch files, 2026-11-09; the test
+/// `only_the_first_section_of_a_name_is_read` holds the answers).
 fn ini_value(text: &[u8], section: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let section = section.trim_spaces();
     let mut inside = false;
     for line in text.split(|&b| b == b'\n') {
         let line = line.trim_spaces();
         if let Some(rest) = line.strip_prefix(b"[") {
+            // The first section of the name ends here: Windows reads no later one.
+            if inside {
+                return None;
+            }
             let name = rest.split(|&b| b == b']').next().unwrap_or(rest);
             inside = name.trim_spaces().eq_ignore_ascii_case(section);
             continue;
@@ -521,6 +528,89 @@ mod tests {
             ini_value(text, b"Display", b"iPresentInterval").unwrap(),
             b"1"
         );
+    }
+
+    /// A file that starts with a UTF-8 byte order mark, as Windows' `GetPrivateProfileStringA`
+    /// reads it (measured on scratch files, 2026-11-09, measure/ini/DESIGN.md): a heading glued
+    /// to the mark is no heading, so the keys under it are in no section and not found, and the
+    /// sections after it read as usual. Play.exe puts nv-rs's block at the end of such a file
+    /// (scripts/launcher `game_ini::with_sections`), where it changes none of the player's keys.
+    #[test]
+    fn a_heading_glued_to_a_byte_order_mark_is_no_heading() {
+        let marked = b"\xef\xbb\xbf[General]\r\nsA=1\r\nsB=two\r\n[Display]\r\nfB=2\r\n\
+                       \r\n[nv-rs General]\r\nsPreset=fixes\r\n";
+        assert_eq!(ini_value(marked, b"General", b"sA"), None);
+        assert_eq!(ini_value(marked, b"General", b"sB"), None);
+        assert_eq!(ini_value(marked, b"Display", b"fB").unwrap(), b"2");
+        assert_eq!(
+            ini_value(marked, b"nv-rs General", b"sPreset").unwrap(),
+            b"fixes"
+        );
+        // The mark alone on the first line: the next line is a heading.
+        let alone = b"\xef\xbb\xbf\r\n[General]\r\nsA=1\r\n";
+        assert_eq!(ini_value(alone, b"General", b"sA").unwrap(), b"1");
+    }
+
+    /// Windows' answers on a file with a repeated section name, measured on scratch files on the
+    /// player's machine (2026-11-09; `GetPrivateProfileStringA` and `GetPrivateProfileIntA` alike):
+    /// only the first section of a name is read, the name compared without case and with the
+    /// spaces in the brackets and in the caller's name trimmed. An empty first section hides a
+    /// later one; an empty key in the first one is found, empty.
+    #[test]
+    fn only_the_first_section_of_a_name_is_read() {
+        let text = b"[A]\r\nx=1\r\n[B]\r\nz=3\r\n[a]\r\ny=2\r\nx=9\r\n[ A ]\r\nw=6\r\n";
+        assert_eq!(ini_value(text, b"A", b"x").unwrap(), b"1");
+        assert_eq!(ini_value(text, b"A", b"y"), None);
+        assert_eq!(ini_value(text, b"A", b"w"), None);
+        assert_eq!(ini_value(text, b"B", b"z").unwrap(), b"3");
+        assert_eq!(ini_value(text, b" A ", b"x").unwrap(), b"1");
+        let text = b"[a]\r\nx=1\r\n[A]\r\ny=2\r\n[C]\r\nq=1\r\n[C]\r\nq=2\r\nr=3\r\n";
+        assert_eq!(ini_value(text, b"A", b"x").unwrap(), b"1");
+        assert_eq!(ini_value(text, b"A", b"y"), None);
+        assert_eq!(ini_value(text, b"C", b"q").unwrap(), b"1");
+        assert_eq!(ini_value(text, b"C", b"r"), None);
+        assert_eq!(ini_value(b"[A]\r\n[A]\r\nx=1\r\n", b"A", b"x"), None);
+        assert_eq!(
+            ini_value(b"[A]\r\n; note\r\n\r\n[A]\r\nx=1\r\n", b"A", b"x"),
+            None
+        );
+        assert_eq!(
+            ini_value(b"[A]\r\nx=\r\n[A]\r\nx=1\r\n", b"A", b"x").unwrap(),
+            b""
+        );
+    }
+
+    /// Three more of Windows' `GetPrivateProfileStringA` answers, measured on scratch files on
+    /// the player's machine (2026-11-10): a key repeated in one section gives its first line,
+    /// whatever its case and spaces; a heading is the text up to its first `]` (text after it, or
+    /// no `]` at all, changes nothing, and `[A]x=9` is a heading, not a key); a key before any
+    /// heading is in no section, not even the one named "", which `[]` opens.
+    #[test]
+    fn repeated_keys_headings_and_keys_before_any_section_read_as_windows_does() {
+        assert_eq!(
+            ini_value(b"[A]\r\nx=1\r\nx=2\r\n", b"A", b"x").unwrap(),
+            b"1"
+        );
+        assert_eq!(
+            ini_value(b"[A]\r\nX=1\r\n x =2\r\n", b"A", b"x").unwrap(),
+            b"1"
+        );
+        let headings: [&[u8]; 6] = [
+            b"[A] trailing\r\nx=1\r\n",
+            b"[A]; note\r\nx=1\r\n",
+            b"[A]]\r\nx=1\r\n",
+            b"[A\r\nx=1\r\n",
+            b"[A]x=9\r\nx=1\r\n",
+            b" [A] \r\nx=1\r\n",
+        ];
+        for text in headings {
+            assert_eq!(ini_value(text, b"A", b"x").unwrap(), b"1");
+        }
+        assert_eq!(ini_value(b"[A]]\r\nx=1\r\n", b"A]", b"x"), None);
+        assert_eq!(ini_value(b"x=1\r\n[A]\r\ny=2\r\n", b"", b"x"), None);
+        assert_eq!(ini_value(b"x=1\r\n[A]\r\ny=2\r\n", b"A", b"x"), None);
+        assert_eq!(ini_value(b"x=1\r\n[]\r\nz=3\r\n", b"", b"z").unwrap(), b"3");
+        assert_eq!(ini_value(b"x=1\r\n[]\r\nz=3\r\n", b"", b"x"), None);
     }
 
     /// Windows' `GetPrivateProfileIntA` answers, measured on the player's machine (2026-10-21).

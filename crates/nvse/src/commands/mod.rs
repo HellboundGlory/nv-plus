@@ -6,8 +6,12 @@ pub mod array;
 pub mod input;
 pub mod inventory;
 pub mod inventory_forms;
+pub mod inventory_info;
+pub mod inventory_items;
 pub mod inventory_ref;
 pub mod math;
+pub mod misc_ref;
+pub mod misc_ref_npc;
 pub mod printf;
 pub mod scripting;
 pub mod string;
@@ -24,6 +28,10 @@ pub fn all() -> Vec<&'static Command> {
         .iter()
         .chain(inventory_ref::COMMANDS)
         .chain(inventory_forms::COMMANDS)
+        .chain(inventory_items::COMMANDS)
+        .chain(inventory_info::COMMANDS)
+        .chain(misc_ref::COMMANDS)
+        .chain(misc_ref_npc::COMMANDS)
         .chain(weapons::COMMANDS)
         .chain(math::COMMANDS)
         .chain(algohol::COMMANDS)
@@ -144,6 +152,17 @@ pub mod rtti {
     pub const TES_RACE: u32 = 0x0118_6370;
     pub const BGS_DESTRUCTIBLE_OBJECT_FORM: u32 = 0x0118_32ac;
     pub const TES_FULL_NAME: u32 = 0x0118_3158;
+    pub const TES_BOUND_OBJECT: u32 = 0x0118_3108;
+    pub const ACTOR: u32 = 0x0118_46d4;
+    pub const TES_CONTAINER: u32 = 0x0118_6c58;
+    pub const TES_LEV_ITEM: u32 = 0x0118_6f7c;
+    pub const TES_SCRIPTABLE_FORM: u32 = 0x0118_3254;
+    pub const TES_ACTOR_BASE: u32 = 0x0118_46e8;
+    pub const TES_KEY: u32 = 0x0118_41b4;
+    pub const BGS_PLACEABLE_WATER: u32 = 0x0118_9d70;
+    pub const TES_NPC: u32 = 0x0118_3a1c;
+    pub const TES_EYES: u32 = 0x0118_6388;
+    pub const TES_HAIR: u32 = 0x0118_63a0;
 }
 
 /// `DYNAMIC_CAST(obj, from, to)` (xNVSE): the exe's `__RTDynamicCast`; 0 for a null object or
@@ -261,6 +280,17 @@ pub(crate) mod test_support {
             rtti::TES_RACE => (1 << 18, 0),
             rtti::BGS_DESTRUCTIBLE_OBJECT_FORM => (1 << 19, 0x7e0),
             rtti::TES_FULL_NAME => (1 << 20, 0x7d0),
+            rtti::ACTOR => (1 << 21, 0),
+            rtti::TES_BOUND_OBJECT => (1 << 22, 0),
+            rtti::TES_CONTAINER => (1 << 23, 0x580),
+            rtti::TES_LEV_ITEM => (1 << 24, 0),
+            rtti::TES_SCRIPTABLE_FORM => (1 << 25, 0x5c0),
+            rtti::TES_ACTOR_BASE => (1 << 26, 0),
+            rtti::TES_KEY => (1 << 27, 0),
+            rtti::BGS_PLACEABLE_WATER => (1 << 28, 0),
+            rtti::TES_NPC => (1 << 29, 0),
+            rtti::TES_EYES => (1 << 30, 0),
+            rtti::TES_HAIR => (1 << 31, 0),
             _ => (0, 0),
         }
     }
