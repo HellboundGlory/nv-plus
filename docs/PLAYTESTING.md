@@ -150,6 +150,7 @@ Each also has a `[nv-rs Fixes]` key in `Fallout.ini` (`bUncap` ... `bNVSEListGua
 | `NV_TOPIC_INDEX` | Dialogue topic index | `host/topic_index.rs` |
 | `NV_SHADER_WARM` | Shaders compiled ahead of first use | `host/fixes.rs` |
 | `NV_IO_WAIT` | IO wait ends on completion | `host/fixes.rs` |
+| `NV_HALF_LOADED_MOVE` | Half-loaded actor's level change | `host/half_loaded_move.rs` |
 | `NV_COSAVE_KEEP` | Co-save keeps other plugins | `host/fixes.rs` (flag read by `nvse`) |
 | `NV_NVSE_ERROR_GUARD` | Script error loop guard | `host/fixes.rs` |
 | `NV_NVSE_IMOD_CHECK` | Image-space event form check | `host/fixes.rs` |
@@ -165,7 +166,7 @@ Play.exe sets these for every run; set them by hand only to run `nv-viewer` with
 
 | Variable | What it does | Default without Play.exe |
 | --- | --- | --- |
-| `NV_D3D9=real`, `wgpu` or `real,wgpu` | The game's own window, drawn by the real Direct3D 9 (`real`), by wgpu alone (`wgpu`, `crates/d3d9-wgpu`: for testing; checked from the main menu into Doc Mitchell's house, the race menu and the Pip-Boy, not yet outdoors), or by the real one with wgpu drawing every frame off screen beside it (`real,wgpu`, for comparison: with `NV_SHOT` both are captured, numbered alike, wgpu's as `wgpu-frame-*.bmp`) | nothing is shown |
+| `NV_D3D9=real`, `wgpu` or `real,wgpu` | The game's own window, drawn by the real Direct3D 9 (`real`), by wgpu alone (`wgpu`, `crates/d3d9-wgpu`: for testing; checked from the main menu into Doc Mitchell's house, the race menu, the Pip-Boy and out onto the Goodsprings street with the game at 4x antialiasing; the game at 8x antialiasing has not been run on wgpu), or by the real one with wgpu drawing every frame off screen beside it (`real,wgpu`, for comparison: with `NV_SHOT` both are captured, numbered alike, wgpu's as `wgpu-frame-*.bmp`) | nothing is shown |
 | `NV_SOUND=out` (or `device`) | The game's sound through DirectSound (`device` keeps the device's pace instead of the game's clock) | silent |
 | `NV_D3D9_ADAPTER=FILE` | The display adapter table | `%LOCALAPPDATA%\nv-rs\d3d9_adapter.tsv` |
 | `NV_DSOUND_TABLE=FILE` | The DirectSound devices and mixing table | none: the run stops and says how to capture it |
@@ -184,7 +185,7 @@ None of these is for players.
 | --- | --- | --- |
 | **Running and pacing** | | |
 | `NV_TYPED=off` (or a list: `docs/ENGINE_CRATE.md`, "Typed code") | Turns the typed (native Rust) families off and runs the translations only, to rule them out when a trace or recording diverges from the original's. A run recorded for nv-trace (`NV_TRACE_OUT`, `NV_TRACE_LIST`) has them off unless `NV_TYPED` names some | on in every preset |
-| `NV_REPEATABLE=FRAMES` | A repeatable run: two runs of the same exe with the same settings and scripted input give byte-identical `NV_D3D9_RECORD` files. A virtual clock (starts at one hour, 1 us a reading, each main frame at least 1/60 s), stepped threads whatever `NV_THREADS` says, a fixed wall clock (2026-01-01 12:00 UTC plus that clock) and process id, GPU queries waited for, window handles written as 0 and query reads left out of the record; the run ends after FRAMES main frames with the record written out, so `cmp` compares two runs | off |
+| `NV_REPEATABLE=FRAMES` | A repeatable run: two runs of the same exe with the same settings and scripted input give byte-identical `NV_D3D9_RECORD` files. A virtual clock (starts at one hour, 1 us a reading, each main frame at least 1/60 s), stepped threads whatever `NV_THREADS` says, a fixed wall clock (2026-01-01 12:00 UTC plus that clock) and process id, GPU queries waited for, window handles written as 0 and query reads left out of the record; the run ends after FRAMES main frames with the record written out, so `cmp` compares two runs. With `NV_SOUND=out` the sound goes to no device (nothing is heard): it is mixed in steps up to the virtual clock, at each main frame's end and before each sound call that changes a voice, so `NV_SOUND_RECORD`'s files compare too, and its log has 0 in the real-time column and every cursor, status and music position the game is given. That makes it a gate between builds (a byte that differs between two builds is a real change in the mixing or in the order of the game's sound calls), not a recording of the device's timing (in play the mixer runs ahead of the clock by the device's latency). The layout and rate are read from this machine's own sound device, so recordings compare only on the same machine; the distortion effect has not been covered by such a run yet | off |
 | `NV_PAR_RENDER=1` | The culling walk on helper cores: a node with 16 or more children (`NV_PAR_RENDER_MIN`) hands them to three helpers (`NV_PAR_RENDER_THREADS`), which log what the walk would register or run; main replays the logs in the serial order. Needs the typed culling family on (with `NV_TYPED=off` nothing splits); the walk's root is never split; works with real and stepped threads. The helpers take no memory from the game's heap (each has 256 KB of its own outside it), so a repeatable run records the same bytes with the switch on, `serial` or unset. `serial` makes the helpers but walks on main, `check` compares the chunked logs with one helper's walk of all the children and prints differences, `time` (alone or with the others, `1,time`) prints each culling walk's time and its registration's every 5 s | off |
 | `NV_WAIT_SPIN_US=n` | Real threads: how long a blocked wait watches for its signal before the thread sleeps, in microseconds (0 sleeps at once) | 50 with more than 2 logical processors, else 0 |
 | `NV_RENDER_THREAD_FRAMES=n` | With the render thread, `Present` returns with at most n earlier frames still to draw | 1 |
@@ -212,7 +213,7 @@ None of these is for players.
 | `NV_FRAME_LOG=FILE`* | One line per main frame (clock, step, player position), with no per-call cost | off |
 | `NV_LOCK_STATS=FILE`*, `NV_REAL_DUMP`* | Real threads: a line per main frame on the game clock and the waits; a dump of thread-local-storage misuse | off |
 | `NV_PHYS_BLEND_LOG=FILE`* | What the smooth physics drawing did each frame | off |
-| `NV_SOUND_RECORD=FILE.wav`* | What goes to the sound device, recorded, with a log | off |
+| `NV_SOUND_RECORD=FILE.wav`* | What goes to the sound device, recorded, with a log (the device's underruns named in it too) | off |
 | `NV_NVSE_EVENT_LOG=FILE`* | The script events raised, to FILE | off |
 | **Profiling and tracing** | | |
 | `NV_PROFILE`*, `NV_PROFILE_SECONDS`, `NV_PROFILE_TOP`, `NV_PROFILE_CALLS`, `NV_PROFILE_STACK`, `NV_PROFILE_SYMBOLS`, `NV_PROFILE_THREADS`, `NV_PROFILE_THREAD_CALLS`* | The sampling profiler and its table: period, rows (default 25), call rows, stack depth, symbol folders, all threads, a file of calls per thread | off |
