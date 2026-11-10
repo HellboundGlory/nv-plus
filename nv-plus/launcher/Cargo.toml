@@ -1,0 +1,17 @@
+[package]
+name = "nv-plus-launcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+description = "The NV+ launcher's logic: finds the player's game, makes this PC's tables, keeps every file the game writes in the package's own folder, starts the game and says plainly what went wrong. Windows only."
+
+[lib]
+name = "nv_plus_launcher"
+
+# Standalone crate, not part of the root workspace, so it keeps its own lock file.
+[workspace]
+
+[dependencies]
+# The sound table's answers as Windows gives them when this runs under Wine or Proton.
+nv-plus-game = { path = "../game" }
