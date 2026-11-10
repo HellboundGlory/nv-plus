@@ -1662,11 +1662,6 @@ impl crate::Host {
             } else {
                 (motion, buttons)
             };
-        (motion[0], motion[1]) = nv_plus_game::mouse::look(
-            crate::uncap::screen(&self.engine) == crate::uncap::Screen::Play,
-            motion[0],
-            motion[1],
-        );
         let frame = self.movement.main_frames;
         for &(at, dx, dy, hold, mask) in mouse_script() {
             if frame >= at && frame < at + hold {

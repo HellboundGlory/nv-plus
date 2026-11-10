@@ -288,8 +288,6 @@ pub struct Choice {
     /// (`engine_platform::d3d9real::want_render_thread`): `NV_RENDER_THREAD=1` or `0` when set;
     /// else off for a test (as its threads are stepped); else [`PLAY_RENDER_THREAD`].
     pub render_thread: bool,
-    /// The look feel and the other NV+ options the run asked for.
-    pub nv_plus: nv_plus_options::Options,
     /// Whether the game's window has no frame and fills the screen
     /// (`engine_platform::d3d9real::want_borderless`): `NV_BORDERLESS` when set (`1` on, else
     /// off); else, in a launcher's play run that is no test ([`is_play_run`]), `Fallout.ini`'s
@@ -313,7 +311,6 @@ impl Choice {
             overrides: Vec::new(),
             threads: "stepped".to_string(),
             render_thread: false,
-            nv_plus: Default::default(),
             borderless: None,
             ini_note: None,
         }
@@ -465,7 +462,6 @@ impl Choice {
             // keeps the window it has (`None`), so a play default never reaches it.
             borderless: ini.borderless.or(play.then_some(PLAY_BORDERLESS)),
             ini_note: ini.bad_line(),
-            nv_plus: Default::default(),
         };
         for line in settings.unwrap_or("").lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -542,10 +538,6 @@ impl Choice {
             Some("0") => choice.render_thread = false,
             Some(other) => return Err(format!("NV_RENDER_THREAD={other}: use 0 or 1")),
         }
-        choice.nv_plus = nv_plus_options::Options::read(
-            game_ini.filter(|_| is_play_run(&env) && !test && !command_line_test),
-            &env,
-        )?;
         Ok(choice)
     }
 
@@ -705,7 +697,6 @@ fn parse_limit(value: &str, source: &str) -> Result<u32, String> {
 pub fn install(e: &mut Engine, choice: &Choice) {
     crate::uncap::set_frame_limit(choice.frame_limit);
     crate::uncap::set_menu_frame_limit(choice.bound_menu_frame_limit());
-    nv_plus_game::install(&choice.nv_plus);
     for fix in FIXES.iter().filter(|f| choice.is_on(f)) {
         (fix.install)(e);
     }
@@ -1510,25 +1501,5 @@ mod tests {
         let paths = candidates(Path::new("game/app"));
         assert_eq!(paths[0], Path::new("game/app/settings.ini"));
         assert_eq!(paths[1], Path::new("game/settings.ini"));
-    }
-
-    /// `Choice::build` reads the look feel through the NV+ crate: the preset word is the
-    /// crate's, a bad variable still stops the start, and the file's keys count only in a
-    /// launcher's play run.
-    #[test]
-    fn the_mouse_feel_comes_from_the_nv_plus_crate() {
-        let choice = Choice::from_parts(None, env_of(&[("NV_MOUSE_SMOOTHING", "Medium")])).unwrap();
-        assert_eq!(choice.nv_plus.mouse.smoothing_ms, 35.0);
-        let err = Choice::from_parts(None, env_of(&[("NV_MOUSE_ACCEL", "hard")])).unwrap_err();
-        assert!(err.starts_with("NV_MOUSE_ACCEL=hard"), "{err}");
-        let ini = "[nv-rs Mouse]\nsSmoothing=Light\n";
-        assert_eq!(with_ini(None, ini, &[]).nv_plus.mouse.smoothing_ms, 20.0);
-        let not_play = Choice::from_texts(None, Some(ini), no_env).unwrap();
-        assert_eq!(not_play.nv_plus.mouse.smoothing_ms, 0.0);
-        let test = with_ini(None, ini, &[("NV_TRACE_LIST", "x")]);
-        assert_eq!(test.nv_plus.mouse.smoothing_ms, 0.0);
-        let play = |name: &str| (name == "NV_SETTINGS").then(|| "x".to_string());
-        let marked = Choice::build(None, Some(ini), play, true).unwrap();
-        assert_eq!(marked.nv_plus.mouse.smoothing_ms, 0.0);
     }
 }
