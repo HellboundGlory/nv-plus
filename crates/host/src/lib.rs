@@ -16,9 +16,11 @@
 //! thread). What it is connected to: docs/ENGINE_CRATE.md
 //! ("In the running game").
 
+pub mod cell_entry_wait;
 pub mod fixes;
 pub mod form_types;
 pub mod frame_log;
+pub mod full_screen;
 pub mod game_file;
 pub mod game_ini;
 pub mod half_loaded_move;
@@ -27,6 +29,7 @@ pub mod native_inflate;
 pub mod phys_blend;
 pub mod player_move;
 pub mod save_out;
+pub mod thread_races;
 pub mod topic_index;
 pub mod uncap;
 
@@ -107,6 +110,9 @@ impl Host {
         if native_inflate::wanted() {
             native_inflate::install(&mut engine);
         }
+        // Full screen asked is drawn in the borderless window over the monitor, in every preset:
+        // nv-rs offers no exclusive full-screen device yet ([`full_screen`]).
+        full_screen::install(&mut engine);
         // xNVSE built in, in every preset (ADR-0016): after the rows, so its wraps wrap what is
         // registered. Vanilla content calls no extender opcode, and every change it makes to
         // vanilla commands is a row.
@@ -171,6 +177,10 @@ impl Host {
         // without it); `NV_RENDER_THREAD=0` makes them on the game's threads.
         #[cfg(windows)]
         engine_platform::d3d9real::want_render_thread(&mut engine, choice.render_thread);
+        #[cfg(windows)]
+        if let Some(dir) = wgpu_cache_path() {
+            engine_platform::d3d9real::want_wgpu_cache(&mut engine, dir);
+        }
         // The borderless window (`fixes::Choice::borderless`: `NV_BORDERLESS`; else, in a
         // launcher's play run, Fallout.ini's `[nv-rs Display] bBorderless` or play's default, on).
         // A test or script without the variable makes no choice: the window as the game makes it.
@@ -316,6 +326,11 @@ impl Host {
         engine_platform::d3d9real::finish_recording(&mut self.engine);
         // The sound's recording too (`NV_SOUND_RECORD`): its WAV headers name every frame.
         engine_platform::dsound::finish_recording(&mut self.engine);
+        // The saves the run wrote, all on disk before the process ends (`NV_SAVE_OUT`).
+        save_out::finish(&self.engine);
+        if let Some(line) = engine::typed::dual_line(&self.engine) {
+            eprintln!("{line}");
+        }
         eprintln!("NV_REPEATABLE: {frames} main frames run; the run ends");
         true
     }
@@ -384,6 +399,21 @@ pub fn texture_cache_path() -> Option<PathBuf> {
             std::env::var_os("LOCALAPPDATA")
                 .map(|d| PathBuf::from(d).join("nv-rs").join("d3dx-cache"))
         })
+}
+
+/// Runs what the platform layer runs before it ends the process itself (`engine_platform::on_exit`:
+/// the copy-out of saves, wgpu's pipeline cache and list), for a host that ends it another way
+/// (the viewer at the end of main's frames, the game's own Quit).
+pub fn run_exit_hooks() {
+    engine_platform::run_exit_hooks();
+}
+
+/// Where the wgpu backend keeps the driver's compiled pipelines between runs (`d3d9-wgpu`'s
+/// `cache.rs`): `NV_WGPU_CACHE`, which the launcher sets to its `userdata\machine\wgpu-cache`
+/// beside the other machine files. Without it nothing is kept: no default in the player's
+/// folders, and tests, scripts and agents' runs keep nothing unless they name a folder.
+pub fn wgpu_cache_path() -> Option<PathBuf> {
+    std::env::var_os("NV_WGPU_CACHE").map(PathBuf::from)
 }
 
 /// Gives the Direct3D 9 layer the player's adapter table ([`adapter_table_path`]) before the

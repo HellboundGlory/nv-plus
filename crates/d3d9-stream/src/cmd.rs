@@ -151,6 +151,27 @@ macro_rules! put_field {
     };
 }
 
+/// A field's encoding with object handles renamed ([`crate::wire::Names`]): a `Handle` field, and
+/// the payloads that are lists of handles (a device's back buffers, a texture's levels, a cube
+/// texture's surfaces).
+macro_rules! put_renamed {
+    (Handle, $n:ident, $x:expr, $out:ident, $names:ident) => {
+        Wire::put(&$names.name(*$x), $out)
+    };
+    (payload, back_buffers, $x:expr, $out:ident, $names:ident) => {
+        $names.put_handles($x, $out)
+    };
+    (payload, levels, $x:expr, $out:ident, $names:ident) => {
+        $names.put_handles($x, $out)
+    };
+    (payload, surfaces, $x:expr, $out:ident, $names:ident) => {
+        $names.put_handles($x, $out)
+    };
+    ($kind:tt, $n:ident, $x:expr, $out:ident, $names:ident) => {
+        put_field!($kind, $x, $out)
+    };
+}
+
 macro_rules! get_field {
     (payload, $r:ident) => {
         $r.data()?
@@ -236,6 +257,22 @@ macro_rules! commands {
                         out.push(Tag::$name as u8);
                         $( put_field!($kind, $field, out); )*
                     } ),*
+                }
+            }
+
+            /// [`Cmd::put`] with every object handle renamed by `names` (the order of first
+            /// use; a destroyed object's name is forgotten after its `Destroy`), so two records
+            /// whose objects lie at other addresses compare by what they draw
+            /// ([`crate::wire::compare_renamed`]).
+            pub(crate) fn put_renamed(&self, out: &mut Vec<u8>, names: &mut crate::wire::Names) {
+                match self {
+                    $( Cmd::$name { $( $field ),* } => {
+                        out.push(Tag::$name as u8);
+                        $( put_renamed!($kind, $field, $field, out, names); )*
+                    } ),*
+                }
+                if let Cmd::Destroy { object } = self {
+                    names.forget(*object);
                 }
             }
         }
@@ -580,10 +617,22 @@ impl fmt::Debug for Native {
 pub trait Backend: Send {
     /// Carries out `cmd`; a sync command's answer is its reply, any other's [`Reply::None`].
     fn execute(&mut self, cmd: Cmd<Data<'_>>) -> Reply;
+
+    /// The threaded runner's render thread has no command to carry out: the backend's own work
+    /// while idle (the GPU polled for answers the game's threads read without waiting). Whether
+    /// it has more of it: the render thread then calls again after a short sleep
+    /// ([`crate::IDLE_POLL`]) instead of sleeping until the next command.
+    fn idle(&mut self) -> bool {
+        false
+    }
 }
 
 impl<B: Backend + ?Sized> Backend for Box<B> {
     fn execute(&mut self, cmd: Cmd<Data<'_>>) -> Reply {
         (**self).execute(cmd)
+    }
+
+    fn idle(&mut self) -> bool {
+        (**self).idle()
     }
 }

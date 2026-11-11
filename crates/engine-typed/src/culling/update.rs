@@ -25,8 +25,6 @@ const POOL_ALLOCATE: u32 = 0x00aa_3e40;
 /// `operator new` (`cdecl(size)`) and the bound block's set-up (`thiscall(block, 0x100, 0)`).
 const OPERATOR_NEW: u32 = 0x0040_1000;
 const BOUND_BLOCK_SETUP: u32 = 0x0054_6890;
-/// The skin instance's bound update (`thiscall(skin, bound)`).
-const SKIN_BOUND: u32 = 0x00a8_6530;
 /// Whether the world bound changed since the copy (`thiscall(bound, old copy)`, a bool).
 const BOUND_CHANGED: u32 = 0x00a9_2660;
 
@@ -74,11 +72,20 @@ pub fn update_world_transform(e: &mut Engine, this: Ptr<NiAVObject>) {
 
 // Typed from 00a68c60
 /// `NiAVObject::UpdateWorldData` (Xbox PDB, `thiscall(object, word)`): an object with a collision
-/// object hands the word to it (slot 0x90); the others update their world transform.
+/// object hands the word to it (slot 0x90: a blend collision object's, `00c817d0`, directly); the
+/// others update their world transform.
 pub fn update_world_data(e: &mut Engine, this: Ptr<NiAVObject>, word: u32) {
     let collision = e.get(this, NiAVObject::m_spCollisionObject);
     if collision != 0 {
-        e.vcall(collision, SLOT_COLLISION_UPDATE, &args![word]);
+        if crate::slot_target(e, collision, SLOT_COLLISION_UPDATE) == 0x00c8_17d0 {
+            typed_call!(
+                crate::collision::FAMILY,
+                0x00c8_17d0,
+                crate::collision::blend::update_world_data(e, Ptr::new(collision), word)
+            );
+        } else {
+            e.vcall(collision, SLOT_COLLISION_UPDATE, &args![word]);
+        }
         return;
     }
     typed_call!(FAMILY, 0x00a6_8bf0, update_world_transform(e, this));
@@ -253,7 +260,12 @@ pub fn geometry_update_world_bound(e: &mut Engine, this: Ptr<NiGeometry>) {
         let skin = e.get(this, NiGeometry::m_spSkinInstance);
         if skin != 0 {
             let bound = e.get(object, NiAVObject::m_kWorldBound);
-            e.call(SKIN_BOUND, &args![skin, bound]);
+            // The skin instance's bound (`00a86530`, the scene family).
+            typed_call!(
+                crate::scene::FAMILY,
+                0x00a8_6530,
+                crate::scene::skin::skin_bound(e, Ptr::new(skin), bound.cast())
+            );
             let bound = e.get(object, NiAVObject::m_kWorldBound);
             typed_call!(FAMILY, 0x00a7_fea0, bound_transform(e, bound, world));
         } else {

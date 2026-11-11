@@ -132,6 +132,8 @@ and the host's tests check one against the other. The fix lines are written with
 
 Settings.cmd's resolution, anti-aliasing, anisotropy and V-sync are the game's own keys, not switches: `iSize W`, `iSize H`, `iMultiSample` and `iMaxAnisotropy` in `FalloutPrefs.ini`, `iPresentInterval` in `Fallout.ini` (where the game reads it).
 
+Exclusive full screen is not offered yet. The game's own `bFull Screen=1` (`FalloutPrefs.ini`) is taken as the borderless window over the monitor, on every backend and in both presets, and the log says so once (`crates/host/src/full_screen.rs`). Play.exe writes `bFull Screen=0` whenever the borderless window is on.
+
 ### 2. Game fixes (the 18 rows of FIXES.md)
 
 Each takes `1` (on) or `0` (off) whatever the preset says; with no `NV_PRESET` the rest of that run is vanilla.
@@ -151,6 +153,9 @@ Each also has a `[nv-rs Fixes]` key in `Fallout.ini` (`bUncap` ... `bNVSEListGua
 | `NV_SHADER_WARM` | Shaders compiled ahead of first use | `host/fixes.rs` |
 | `NV_IO_WAIT` | IO wait ends on completion | `host/fixes.rs` |
 | `NV_HALF_LOADED_MOVE` | Half-loaded actor's level change | `host/half_loaded_move.rs` |
+| `NV_THREAD_RACES` | Thread races | `host/thread_races.rs` |
+| `NV_TEXTURE_READ_FIRST` | Texture files read before the renderer's lock | `host/fixes.rs` |
+| `NV_CELL_ENTRY_WAIT` | Cell entry waits for its own cell | `host/cell_entry_wait.rs` |
 | `NV_COSAVE_KEEP` | Co-save keeps other plugins | `host/fixes.rs` (flag read by `nvse`) |
 | `NV_NVSE_ERROR_GUARD` | Script error loop guard | `host/fixes.rs` |
 | `NV_NVSE_IMOD_CHECK` | Image-space event form check | `host/fixes.rs` |
@@ -158,7 +163,7 @@ Each also has a `[nv-rs Fixes]` key in `Fallout.ini` (`bUncap` ... `bNVSEListGua
 | `NV_NVSE_SIZE_CAPS` | Script array and string size caps | `host/fixes.rs` |
 | `NV_NVSE_NULL_GUARD` | Script missing array guard | `host/fixes.rs` |
 | `NV_NVSE_CYCLE_GUARD` | Script array cycle guard | `host/fixes.rs` |
-| `NV_NVSE_LIST_GUARD` | Script inventory list guard | `host/fixes.rs` |
+| `NV_NVSE_LIST_GUARD` | Script list and scan guard | `host/fixes.rs` |
 
 ### 3. Set by Play.exe
 
@@ -166,12 +171,13 @@ Play.exe sets these for every run; set them by hand only to run `nv-viewer` with
 
 | Variable | What it does | Default without Play.exe |
 | --- | --- | --- |
-| `NV_D3D9=real`, `wgpu` or `real,wgpu` | The game's own window, drawn by the real Direct3D 9 (`real`), by wgpu alone (`wgpu`, `crates/d3d9-wgpu`: for testing; checked from the main menu into Doc Mitchell's house, the race menu, the Pip-Boy and out onto the Goodsprings street with the game at 4x antialiasing; the game at 8x antialiasing has not been run on wgpu), or by the real one with wgpu drawing every frame off screen beside it (`real,wgpu`, for comparison: with `NV_SHOT` both are captured, numbered alike, wgpu's as `wgpu-frame-*.bmp`) | nothing is shown |
+| `NV_D3D9=real`, `wgpu` or `real,wgpu` | The game's own window, drawn by the real Direct3D 9 (`real`), by wgpu alone (`wgpu`, `crates/d3d9-wgpu`: for testing; checked from the main menu into Doc Mitchell's house, the race menu, the Pip-Boy and out onto the Goodsprings street with the game at 4x antialiasing; at 8x antialiasing it runs, its pictures not yet compared), or by the real one with wgpu drawing every frame off screen beside it (`real,wgpu`, for comparison: with `NV_SHOT` both are captured, numbered alike, wgpu's as `wgpu-frame-*.bmp`) | nothing is shown |
 | `NV_SOUND=out` (or `device`) | The game's sound through DirectSound (`device` keeps the device's pace instead of the game's clock) | silent |
 | `NV_D3D9_ADAPTER=FILE` | The display adapter table | `%LOCALAPPDATA%\nv-rs\d3d9_adapter.tsv` |
 | `NV_DSOUND_TABLE=FILE` | The DirectSound devices and mixing table | none: the run stops and says how to capture it |
 | `NV_D3DX_CACHE=DIR` | The D3DX texture cache (used only with `NV_TEXTURES=dll`, or for files `crates/d3dx-tex` does not translate) | `%LOCALAPPDATA%\nv-rs\d3dx-cache` |
-| `NV_SAVE_OUT=DIR` | The saves the game writes, copied out to DIR, and the ones it deletes removed there (`crates/host/src/save_out.rs`) | saves stay in memory |
+| `NV_WGPU_CACHE=DIR` | Where wgpu keeps the graphics driver's compiled pipelines between runs (Vulkan; wgpu keeps none for Direct3D 12): a start whose driver has nothing cached for the program makes them from this file instead of compiling them again. It also keeps the list of the pipelines this machine's runs made (`pipelines.txt`, on every backend), which the next start makes before play behind the loading screen, with the list shipped in the exe. A missing, damaged or foreign file is ignored with one log line and made anew. Play.exe sets `userdata\machine\wgpu-cache`; `d3d9-replay` reads it too | nothing kept |
+| `NV_SAVE_OUT=DIR` | The saves the game writes, copied out to DIR at the end of the frame that wrote them (written by a thread of their own; a clean end waits for them), and the ones it deletes removed there (`crates/host/src/save_out.rs`) | saves stay in memory |
 | `NV_PREFS_OUT=FILE` | The `FalloutPrefs.ini` the game writes, copied out to FILE | stays in memory |
 | `NV_REPORT_DIR=DIR`, `NV_REPORT_LOG=FILE` | F12 in the game's window makes `DIR\NNN\` with the frame, the end of FILE and a `note.txt` for the player (`crates/engine-platform/src/d3d9real.rs`) | no F12 report |
 | `NV_SETTINGS=FILE` | The settings file | `settings.ini` beside the program or in the folder above it |
@@ -184,21 +190,23 @@ None of these is for players.
 | Variable | What it does | Default |
 | --- | --- | --- |
 | **Running and pacing** | | |
-| `NV_TYPED=off` (or a list: `docs/ENGINE_CRATE.md`, "Typed code") | Turns the typed (native Rust) families off and runs the translations only, to rule them out when a trace or recording diverges from the original's. A run recorded for nv-trace (`NV_TRACE_OUT`, `NV_TRACE_LIST`) has them off unless `NV_TYPED` names some | on in every preset |
+| `NV_TYPED=off` (or a list: `docs/ENGINE_CRATE.md`, "Typed code") | Turns the typed (native Rust) families off and runs the translations only, to rule them out when a trace or recording diverges from the original's. A run recorded for nv-trace (`NV_TRACE_OUT`, `NV_TRACE_LIST`) has them off unless `NV_TYPED` names some. For a family moved out of the game's heap (stage 2, "Moved families"): `<family>:dual` keeps both forms and compares every access (threads stepped; the status line counts the differences), `<family>:moved` moves its objects with the heap kept as before, `<family>:freed` frees the guest bytes too; the switch refuses these for a family without a stage-2 form | on in every preset |
+| `NV_RESERVE_GAP` | The scrap heaps' 8 MiB reservations (and every other `VirtualAlloc` the game leaves to the system) go in the gap below the heap (0x01410000..0x10000000) instead of being heap blocks: they then take none of the heap's address space (about 128-144 MB on the smoothness route, 99% of it never committed). `off` makes each a heap block again; `held` (for the gate only) places them the same way but still takes each one's heap block, unused, so the heap is laid out as with the setting off: a run with `held` and one with it off can then be compared byte for byte | on (`off` to turn it off) |
 | `NV_REPEATABLE=FRAMES` | A repeatable run: two runs of the same exe with the same settings and scripted input give byte-identical `NV_D3D9_RECORD` files. A virtual clock (starts at one hour, 1 us a reading, each main frame at least 1/60 s), stepped threads whatever `NV_THREADS` says, a fixed wall clock (2026-01-01 12:00 UTC plus that clock) and process id, GPU queries waited for, window handles written as 0 and query reads left out of the record; the run ends after FRAMES main frames with the record written out, so `cmp` compares two runs. With `NV_SOUND=out` the sound goes to no device (nothing is heard): it is mixed in steps up to the virtual clock, at each main frame's end and before each sound call that changes a voice, so `NV_SOUND_RECORD`'s files compare too, and its log has 0 in the real-time column and every cursor, status and music position the game is given. That makes it a gate between builds (a byte that differs between two builds is a real change in the mixing or in the order of the game's sound calls), not a recording of the device's timing (in play the mixer runs ahead of the clock by the device's latency). The layout and rate are read from this machine's own sound device, so recordings compare only on the same machine; the distortion effect has not been covered by such a run yet | off |
-| `NV_PAR_RENDER=1` | The culling walk on helper cores: a node with 16 or more children (`NV_PAR_RENDER_MIN`) hands them to three helpers (`NV_PAR_RENDER_THREADS`), which log what the walk would register or run; main replays the logs in the serial order. Needs the typed culling family on (with `NV_TYPED=off` nothing splits); the walk's root is never split; works with real and stepped threads. The helpers take no memory from the game's heap (each has 256 KB of its own outside it), so a repeatable run records the same bytes with the switch on, `serial` or unset. `serial` makes the helpers but walks on main, `check` compares the chunked logs with one helper's walk of all the children and prints differences, `time` (alone or with the others, `1,time`) prints each culling walk's time and its registration's every 5 s | off |
+| `NV_PAR_RENDER` | The culling walk on several cores (on by default in play): a node with 16 or more children (`NV_PAR_RENDER_MIN`) shares them out as tasks between the helpers and main (three helpers from 8 logical processors up, none below 8; `NV_PAR_RENDER_THREADS` sets the count), and a node of that size met inside a task becomes tasks too. The main world's walk splits, and so does the water's reflection's, which with high-detail reflections culls the same world through the reflected camera; a walk through a compound frustum (an interior's portals and occlusion) stays serial. Each walker logs what the walk would register or run; main replays the logs in the serial order, so nothing the game sees changes: a repeatable run records the same bytes with it on, off or `serial` (the helpers take no memory from the game's heap). Needs the typed culling family on (with `NV_TYPED=off` nothing splits). By default it splits only with real threads (play); stepped threads (repeatable and recorded runs, the tests) keep the serial walk unless `NV_PAR_RENDER=1` asks for it, and `off` turns it off. `serial` makes the helpers but walks on main, `check` compares the tasks' logs with one walker's walk of all the children and prints differences (`recheck`, its control, makes the first walk one walker's too, so its differences are the scene changing between the two walks), `time` (alone or with the others, `1,time`) prints every 5 s the culling walks' times by root, process and the process's mode (the water reflection's walk of the world is the mode-4 row), their registration's and their splits', and after each table an outline of one walk (its nodes by depth with their times, which split, and what the replay ran on main) | on with real threads (`off` to turn it off) |
 | `NV_WAIT_SPIN_US=n` | Real threads: how long a blocked wait watches for its signal before the thread sleeps, in microseconds (0 sleeps at once) | 50 with more than 2 logical processors, else 0 |
 | `NV_RENDER_THREAD_FRAMES=n` | With the render thread, `Present` returns with at most n earlier frames still to draw | 1 |
 | `NV_RENDER_THREAD_CHUNK=n` | With the render thread, how many commands are handed over at a time | built-in size |
 | `NV_RENDER_THREAD_STATS=1` | With the render thread: a line a second on its hand-overs and the game's waits | off |
 | `NV_D3D9_STREAM_CHECK=1` | With the render thread: every command hashed as recorded and as carried out, the run stopped at a difference | off |
 | `NV_D3D9_RECORD=FILE` | Every Direct3D 9 command to FILE (`d3d9_stream::wire`), to replay into another backend | off |
-| `NV_D3D9_BACKGROUND=1` | The window opens without taking the focus (scripted runs) | off |
+| `NV_D3D9_BACKGROUND=1` | The window opens without taking the focus, behind the other windows (scripted runs) | off |
+| `NV_D3D9_HIDDEN=1` | The window is never shown: nothing on any monitor, not even for a moment as it opens, and no taskbar button. The real Direct3D 9 device draws and presents into it as into a shown one and the game sees the same window, so a recorded run is byte for byte the same as with `NV_D3D9_BACKGROUND` (for the scripted runs whose recordings are compared; it wins over `NV_D3D9_BACKGROUND`). Nobody can close such a window: the run ends by its frame count or time limit | off |
 | `NV_SLICE=n` | Stepped threads: calls between turns (0: only at waits and sleeps) | 200000 |
 | `NV_WAKE_DELAY=n` | Stepped threads: calls after a signal before the threads it woke run | built-in |
 | `NV_TEXTURES=dll` | The game's textures from the player's 64-bit `d3dx9_38.dll` (with `NV_D3D9=real`) or the texture cache, as before `crates/d3dx-tex`; files `crates/d3dx-tex` does not translate, and a thread at 64-bit precision, go to the DLL in any case, and without one are refused as D3DX refuses a file it cannot read | `crates/d3dx-tex` makes them, byte for byte the 32-bit DLL's |
 | `NV_D3D9_PRESENT=immediate` | The real Direct3D 9 device and the wgpu backend present without waiting for the display, so a frame rate measures the work | the game's `iPresentInterval` |
-| `NV_WGPU_BACKEND=dx12`, `vulkan`, `gl` or `software`; `NV_WGPU_DEBUG` | wgpu backend: which graphics interface (`software`: the platform's software adapter, WARP on Windows, the one CI's runners have: for running the GPU tests there); wgpu's own debug checks | Direct3D 12 on Windows; off |
+| `NV_WGPU_BACKEND=vulkan`, `dx12`, `gl` or `software`; `NV_WGPU_DEBUG` | wgpu backend: which graphics interface (`software`: the platform's software adapter, WARP on Windows, the one CI's runners have: for running the GPU tests there); wgpu's own debug checks. On Vulkan, NVIDIA's driver filters distant textures a shade differently from its Direct3D (its own anisotropic filtering: on the Goodsprings street 10-26% of pixels differ from Direct3D 9's by a mean under 1 of 255 levels, against under 1% of pixels on Direct3D 12; accepted) | Vulkan, then Direct3D 12 on a card without a Vulkan driver; off |
 | **Scripted input and movement runs** | | |
 | `NV_MOVE_KEYS`*, `NV_MOVE_MOUSE`* | Scripted keys and mouse by main's frame (`crates/host/src/player_move.rs`) | none |
 | `NV_MOVE_REAL_INPUT=1`* | Real input reaches the game even with a script set | off |
@@ -217,6 +225,7 @@ None of these is for players.
 | `NV_NVSE_EVENT_LOG=FILE`* | The script events raised, to FILE | off |
 | **Profiling and tracing** | | |
 | `NV_PROFILE`*, `NV_PROFILE_SECONDS`, `NV_PROFILE_TOP`, `NV_PROFILE_CALLS`, `NV_PROFILE_STACK`, `NV_PROFILE_SYMBOLS`, `NV_PROFILE_THREADS`, `NV_PROFILE_THREAD_CALLS`* | The sampling profiler and its table: period, rows (default 25), call rows, stack depth, symbol folders, all threads, a file of calls per thread | off |
+| `NV_PROFILE_UNDER=ADDR[,ADDR..]`* | With `NV_PROFILE`: the function, native and call tables count only what runs inside these exe functions (hex addresses; the header's sample total, the phases, game-threads and sleep lines and the calls-a-frame header stay whole-run), and each table is followed by the calls a frame of every caller-to-callee edge inside them, the edge into a named function from its outer caller included; a named function deeper than 256 shadow-stack slots has its calls counted but not its samples. The sampler's first line says which addresses it counts under, which entries it ignored, and when none was usable (then everything is counted) (a measuring aid; e.g. `00b6ba20,00b6b930`, the main world's draw) | off: everything counted |
 | `NV_TRACE_OUT`, `NV_TRACE_LIST`*, `NV_TRACE_FLUSH=buffered` | A call trace for nv-trace: the file, the list of functions, no flush after each call | off |
 | `NV_BENCH_CALLS`*, `NV_BENCH_CALL_COUNTS`*, `NV_BENCH_FUNCS`, `NV_BENCH_HOT` | The dispatch-speed benchmark's sizes (ignored test) | built-in sizes |
 | `NV_CENSUS`*, `NV_TOUCH`*, `NV_RACE_CENSUS` | A census of the game's memory at chosen frames; which typed family touches what; races between threads | off |
@@ -224,6 +233,7 @@ None of these is for players.
 | `NV_WORD_CHECK`*, `NV_WATCH`*, `NV_WATCH_REPORTS=N`, `NV_QUEUE_CHECK`*, `NV_BLOCK_CHECK`*, `NV_HKMEM_CHECK`*, `NV_TOPIC_INDEX_CHECK`* | Words given to a call and not taken; memory changing at an address; queues; memory blocks; Havok memory; the topic index against the original's walk (goes with `NV_TOPIC_INDEX=1`) | off |
 | `NV_SKIN_CHECK`*, `NV_HEAD_CHECK`*, `NV_FACE_CHECK`*, `NV_FACE_CHECK_DIR`, `NV_SPEECH_CHECK`*, `NV_LIGHT_CHECK`*, `NV_PASS_CHECK`*, `NV_AUDIO_CHECK`* | Bone matrices, heads, faces, lip-sync, lights, shader passes and sound mixing against the original's | off |
 | `NV_D3D9_TEXTURES=check`, `NV_D3D9_BUFFERS=check` | Texture and buffer bytes kept outside the game's memory, with checks printed | off |
+| `NV_DSOUND_BUFFERS=guest`, `NV_DSOUND_BUFFERS=same-layout` | Where sound buffers keep their samples: `guest` in the game's 32-bit memory, as before (for comparisons); `same-layout` outside it, handed out through each buffer's old block, so the game's memory is laid out as with `guest` and a repeatable run compares byte for byte (a write through an old lock's address after its unlock is printed) | outside the game's memory, in its memory only while locked |
 | `NV_D3D9_REFS=FILE`, `NV_D3D9_STUB_LOG` | Every texture reference-count change to FILE; the calls the Direct3D 9 model test makes | off |
 | **Inputs of ignored tests** (need the player's game files or a measured capture) | | |
 | `NV_EXE`, `NV_SCRIPT`, `NV_SCRIPT_TRACE`, `NV_INFLATE_EVERY`, `NV_INFLATE_PART`, `NV_VORBIS_TEST_DIR`, `NV_MUSIC_MP3`, `NV_D3DX_FUNCTIONS`, `NV_D3DX_IMAGE_INFO`, `NV_DSMIX_SETPOS`, `NV_DSMIX_SRC`, `NV_DSMIX_SURROUND`, `NV_DSOUND_FREQPHASE`, `NV_REPLAY_PROGRAMS`, `NV_REPLAY_OUT` | Where an ignored test finds the exe, a script, the game's archives, sounds or its own measured captures, or writes its result | the test skips or stops and says what to set |
@@ -254,7 +264,8 @@ GitHub Releases; the packages there from before 2026-11-03 are of the removed vi
   playing, `game` and `mods`), the tables (`machine`), `logs` and `reports`; an older preview's
   `settings.ini` is moved into the two profiles' files once (`settings.ini.migrated`). The table's
   `SHGetFolderPathA` answers point at them. The game's own writes stay in memory as ever
-  (`engine-platform` files.rs); only `NV_SAVE_OUT` and `NV_PREFS_OUT` reach the disk, inside `userdata`.
+  (`engine-platform` files.rs); only `NV_SAVE_OUT`, `NV_PREFS_OUT` and (with `NV_D3D9=wgpu`)
+  `NV_WGPU_CACHE` reach the disk, inside `userdata`.
 - **The tables:** the adapter table is made again at every start (about 1.3 s here), so a new graphics
   card, driver, monitor, time zone or Windows language can't leave it stale. If its tools fail, the
   last good table is used. The sound table (about 19 s here) is made again when Windows' build or the

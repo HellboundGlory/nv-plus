@@ -67,9 +67,17 @@ struct Gpu {
 
 impl Gpu {
     fn new(size: u32, samples: u32) -> Option<Gpu> {
+        Gpu::with_cache(size, samples, None)
+    }
+
+    /// As [`Gpu::new`], keeping the driver's pipelines in `cache` ([`WgpuBackend::with_cache_dir`]).
+    fn with_cache(size: u32, samples: u32, cache: Option<std::path::PathBuf>) -> Option<Gpu> {
         // A failed test leaves the lock poisoned; the next one still takes its turn.
         let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         let mut b = WgpuBackend::new(Output::Offscreen);
+        if let Some(dir) = cache {
+            b = b.with_cache_dir(dir);
+        }
         let present = words(&[size, size, A8R8G8B8, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0]);
         let back = words(&[BACK]);
         b.execute(Cmd::CreateDevice {
@@ -626,6 +634,88 @@ fn get_render_target_data_of_a_multisampled_target_leaves_the_destination() {
         Reply::Bytes(Some(b)) => assert_eq!(b, before),
         other => panic!("{other:?}"),
     }
+    // A destination never written holds zeros, and is read back as such: an answer, so the
+    // model goes on (it stops the run on none).
+    const FRESH: u32 = 0x3010;
+    g.run(Cmd::CreateOffscreenSurface {
+        device: DEVICE,
+        surface: FRESH,
+        width: 2,
+        height: 2,
+        format: A8R8G8B8,
+        pool: 2,
+    });
+    match g.run(Cmd::GetRenderTargetData {
+        device: DEVICE,
+        source: RT,
+        destination: FRESH,
+        pitch: 8,
+    }) {
+        Reply::Rows(Some(r)) => assert_eq!((r.row, r.bytes), (8, vec![0; 16])),
+        other => panic!("{other:?}"),
+    }
+    match g.run(Cmd::ReadSurface {
+        surface: FRESH,
+        size: 16,
+    }) {
+        Reply::Bytes(Some(b)) => assert_eq!(b, vec![0; 16]),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A lost device (a driver reset, the graphics card gone) reads nothing back: `GetRenderTargetData`
+/// still answers, with what the destination holds (as the real Direct3D 9 backend reads its
+/// destination after a failed copy), so a save's thumbnail made then does not stop the game
+/// (the model stops the run on no answer). Drawing and presenting go on without a stop too.
+#[test]
+fn a_read_back_after_the_device_is_lost_answers_what_the_destination_holds() {
+    let Some(mut g) = Gpu::new(2, 1) else { return };
+    const SYS: u32 = 0x3000;
+    g.run(Cmd::CreateOffscreenSurface {
+        device: DEVICE,
+        surface: SYS,
+        width: 2,
+        height: 2,
+        format: A8R8G8B8,
+        pool: 2,
+    });
+    let before: Vec<u8> = (0..16).collect();
+    g.run(Cmd::UploadSurface {
+        surface: SYS,
+        row: 8,
+        rows: 2,
+        data: Data::Bytes(&before),
+    });
+    g.clear(1, 0x1122_3344, 1.0);
+    g.b.device().expect("the device").lose();
+    g.clear(1, 0x5566_7788, 1.0);
+    g.colour([1.0, 0.0, 0.0, 1.0]);
+    g.cover(0.5);
+    g.run(Cmd::Present {
+        device: DEVICE,
+        source: None,
+        dest: None,
+        window: 0,
+        dirty: false,
+        model: 0,
+        frame: 1,
+    });
+    match g.run(Cmd::GetRenderTargetData {
+        device: DEVICE,
+        source: RT,
+        destination: SYS,
+        pitch: 8,
+    }) {
+        Reply::Rows(Some(r)) => assert_eq!((r.row, r.bytes.clone()), (8, before.clone())),
+        other => panic!("{other:?}"),
+    }
+    match g.run(Cmd::ReadSurface {
+        surface: SYS,
+        size: 16,
+    }) {
+        Reply::Bytes(Some(b)) => assert_eq!(b, before),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -904,5 +994,739 @@ fn an_8_bit_target_resolves_gamma_corrected() {
                 assert_eq!(reds[y * 8 + x], want, "{samples}x: ({x}, {y}) in {reds:?}");
             }
         }
+    }
+}
+
+/// The register blocks are written only when what they carry changed, and only up to the
+/// highest constant the bound shaders read: within one pass, (1) a change of only a vertex
+/// constant moves the next draw; (2) a vertex shader reading a constant beyond the ones the last
+/// block carried (c10, set before any draw) gets it with no new constant call; (3) a change of
+/// only a pixel constant changes the next draw's colour.
+#[test]
+fn constant_changes_between_draws_in_one_pass_reach_the_shaders() {
+    let Some(mut g) = Gpu::new(8, 1) else { return };
+    const VS4: u32 = 0x1320;
+    const VS10: u32 = 0x1330;
+    // vs_2_0: dcl_position v0; add oPos, v0, cN.
+    for (shader, n) in [(VS4, 4u32), (VS10, 10)] {
+        let mut t = vec![0xFFFE_0200];
+        t.extend(ins(31, &[0x8000_0000, 0x900F_0000]));
+        t.extend(ins(2, &[0xC00F_0000, 0x90E4_0000, 0xA0E4_0000 | n]));
+        t.push(END);
+        let t = words(&t);
+        g.run(Cmd::CreateShader {
+            device: DEVICE,
+            shader,
+            pixel: false,
+            tokens: Data::Bytes(&t),
+        });
+    }
+    let vconst = |g: &mut Gpu, n: u32, v: [f32; 4]| {
+        let r = floats(&v);
+        g.run(Cmd::SetConstants {
+            device: DEVICE,
+            kind: 0,
+            start: n,
+            count: 1,
+            data: Data::Bytes(&r),
+        });
+    };
+    let shader = |g: &mut Gpu, s: u32| {
+        g.run(Cmd::SetShader {
+            device: DEVICE,
+            pixel: false,
+            shader: s,
+        })
+    };
+    // The top left quarter of the target (clip x -1 to 0, y 0 to 1).
+    let corner = |g: &mut Gpu| {
+        let q = floats(&[
+            -1.0, 0.0, 0.5, 1.0, -1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.5, 1.0, //
+            0.0, 0.0, 0.5, 1.0, -1.0, 1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0,
+        ]);
+        let offset = 96 * (g.next % 32);
+        g.next += 1;
+        g.run(Cmd::UploadBuffer {
+            buffer: VB,
+            offset,
+            flags: 0,
+            data: Data::Bytes(&q),
+        });
+        g.run(Cmd::SetStreamSource {
+            device: DEVICE,
+            stream: 0,
+            buffer: VB,
+            offset,
+            stride: 16,
+        });
+        g.run(Cmd::DrawPrimitive {
+            device: DEVICE,
+            kind: 4,
+            start: 0,
+            count: 2,
+        });
+    };
+    g.state(ZENABLE, 0);
+    g.state(CULLMODE, 1);
+    vconst(&mut g, 10, [0.0, -1.0, 0.0, 0.0]);
+    vconst(&mut g, 4, [0.0, 0.0, 0.0, 0.0]);
+    shader(&mut g, VS4);
+    g.colour([1.0, 0.0, 0.0, 1.0]);
+    g.clear(1, 0, 1.0);
+    corner(&mut g); // top left, red
+    vconst(&mut g, 4, [1.0, 0.0, 0.0, 0.0]);
+    corner(&mut g); // top right, red: only c4 changed
+    shader(&mut g, VS10);
+    corner(&mut g); // bottom left, red: c10 was never sent with a draw
+    shader(&mut g, VS4);
+    vconst(&mut g, 4, [1.0, -1.0, 0.0, 0.0]);
+    corner(&mut g); // bottom right, red
+    g.colour([0.0, 1.0, 0.0, 1.0]);
+    corner(&mut g); // bottom right again, green: only the pixel shader's c0 changed
+    let px = g.pixels();
+    let at = |x: usize, y: usize| px[y * 8 + x];
+    assert_eq!(at(1, 1), [0, 0, 255, 255], "top left");
+    assert_eq!(
+        at(6, 1),
+        [0, 0, 255, 255],
+        "top right: the vertex constant change"
+    );
+    assert_eq!(
+        at(1, 6),
+        [0, 0, 255, 255],
+        "bottom left: c10 on the shader change"
+    );
+    assert_eq!(
+        at(6, 6),
+        [0, 255, 0, 255],
+        "bottom right: the pixel constant change"
+    );
+}
+
+/// The pipeline cache file's envelope, as `cache.rs` writes it (magic, version 2, length,
+/// FNV-1a 64 of the bytes): the test makes files of its own with it.
+fn envelope(data: &[u8]) -> Vec<u8> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut out = b"NVWGPUPC".to_vec();
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// The driver's pipelines kept between runs. Where the backend has a pipeline cache (Vulkan), a
+/// device that made a pipeline leaves the file behind and the next one reads it; a file whose
+/// bytes do not match their hash, a truncated one, and a FOREIGN one (a valid envelope around
+/// wgpu bytes made for another adapter) are each ignored with a new, empty cache, and the device
+/// draws the same pixels; a folder that is a file gives no cache and a working device. Without a
+/// pipeline cache (Direct3D 12, the software adapter) nothing is kept and the draws are the same.
+#[test]
+fn the_pipeline_cache_file_is_kept_and_a_bad_one_is_ignored() {
+    // A scratch folder in the build's own target folder.
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pipeline-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The pixels and what the device made of its cache file.
+    let draw = |cache: Option<std::path::PathBuf>| -> Option<(Vec<u8>, Option<String>)> {
+        let mut g = Gpu::with_cache(4, 1, cache)?;
+        g.colour([1.0, 0.5, 0.25, 1.0]);
+        g.clear(1, 0, 1.0);
+        g.cover(0.5);
+        let note = g.b.device().expect("the device").pipeline_cache_note();
+        Some((g.reds(), note))
+    };
+    let Some((plain, none)) = draw(None) else {
+        return;
+    };
+    assert_eq!(none, None, "no folder, no cache");
+    let folder = dir.join("new");
+    let (first, note) = draw(Some(folder.clone())).unwrap();
+    assert_eq!(first, plain);
+    let Some(note) = note else {
+        // No pipeline cache on this backend: nothing kept, nothing to read back.
+        // (The pipeline list, `pipelines.txt`, is kept on every backend.)
+        assert!(std::fs::read_dir(&folder).map_or(true, |d| d
+            .flatten()
+            .all(|e| e.path().extension() != Some(std::ffi::OsStr::new("bin")))));
+        eprintln!("this backend keeps no pipeline cache");
+        return;
+    };
+    assert!(note.starts_with("none yet"), "{note}");
+    // The file is there after the device went, and is read back.
+    let files: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let file = files[0].clone();
+    let good = std::fs::read(&file).unwrap();
+    let (pixels, note) = draw(Some(folder.clone())).unwrap();
+    assert_eq!(pixels, plain);
+    assert!(note.as_deref().unwrap().ends_with("KB read"), "{note:?}");
+    // Each bad file: ignored by name, a new cache, the same pixels.
+    let wgpu_bytes = &good[28..];
+    let mut altered = good.clone();
+    let n = altered.len();
+    altered[n / 2] ^= 0x55;
+    let truncated = good[..good.len() - 3].to_vec();
+    // wgpu's header: magic 8, version 4, ABI 4, backend 1, then the adapter key (15).
+    let mut foreign_bytes = wgpu_bytes.to_vec();
+    foreign_bytes[20] ^= 0x5A;
+    let foreign = envelope(&foreign_bytes);
+    let mut backend_bytes = wgpu_bytes.to_vec();
+    backend_bytes[16] ^= 0x03;
+    let other_backend = envelope(&backend_bytes);
+    for (bytes, why) in [
+        (altered, "do not match their hash"),
+        (truncated, "truncated"),
+        (foreign, "ignored"),
+        (other_backend, "ignored"),
+    ] {
+        std::fs::write(&file, &bytes).unwrap();
+        let (pixels, note) = draw(Some(folder.clone())).unwrap();
+        assert_eq!(pixels, plain, "{why}");
+        let note = note.unwrap();
+        assert!(
+            note.contains(why) && note.contains("ignored"),
+            "{why}: {note}"
+        );
+    }
+    // A "folder" that is a file: no cache, the device works.
+    std::fs::write(dir.join("a-file"), b"not a folder").unwrap();
+    let (pixels, note) = draw(Some(dir.join("a-file"))).unwrap();
+    assert_eq!(pixels, plain);
+    assert_eq!(note, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The backend's own loading screen: black at the corners and the logo lit in the middle; the
+/// bar filled to the fraction done (a quarter against three quarters: some row has the fill's
+/// colour at three quarters where it has the empty bar's grey at a quarter); and (on Windows,
+/// where GDI draws the text) another status line changes pixels. A window narrower than the bar
+/// still draws.
+#[test]
+fn the_loading_screen_shows_the_logo_the_text_and_the_bar() {
+    let Some(mut g) = Gpu::new(4, 1) else { return };
+    let p = |status: &str, done: f32| d3d9_wgpu::loading::Progress {
+        title: "Loading".into(),
+        status: status.into(),
+        done,
+    };
+    let (w, h) = (640u32, 360u32);
+    let d = g.b.device().expect("the device");
+    let quarter = d.progress_pixels(w, h, &p("Preparing shaders 212 of 1480", 0.25));
+    let most = d.progress_pixels(w, h, &p("Preparing shaders 212 of 1480", 0.75));
+    let other = d.progress_pixels(w, h, &p("Preparing shaders 1111 of 1480", 0.25));
+    // Narrower than the bar (64 pixels at least) and the logo: no underflow, a picture.
+    let narrow = d.progress_pixels(40, 30, &p("x", 0.5));
+    assert_eq!(narrow.len(), 40 * 30 * 4);
+    assert_eq!(quarter.len(), (w * h * 4) as usize);
+    let at = |px: &[u8], x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+    for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+        assert_eq!(at(&quarter, x, y), [0, 0, 0], "corner {x},{y}");
+    }
+    let lit = (h / 4..h / 2)
+        .flat_map(|y| (w / 3..2 * w / 3).map(move |x| (x, y)))
+        .filter(|&(x, y)| at(&quarter, x, y).iter().any(|&c| c > 64))
+        .count();
+    assert!(lit > 500, "{lit} pixels of the logo lit");
+    // The bar: from x = w/3, w/3 wide; at x = w/3 + w/6 (half of it) the fill (B G R about 89, 191,
+    // 230) at three quarters, the empty bar's grey (about 64) at a quarter, in the same row.
+    let x = w / 3 + w / 6;
+    let fill = |c: [u8; 3]| c[2] > 180 && c[1] > 140 && c[0] < 140;
+    let grey = |c: [u8; 3]| c.iter().all(|&v| (40..=90).contains(&v));
+    let row = (0..h).find(|&y| fill(at(&most, x, y)) && grey(at(&quarter, x, y)));
+    assert!(
+        row.is_some(),
+        "no row with the bar filled at 3/4 and empty at 1/4"
+    );
+    #[cfg(windows)]
+    {
+        let changed = quarter
+            .chunks_exact(4)
+            .zip(other.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            changed > 20,
+            "{changed} pixels changed with the status line"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = other;
+}
+
+/// The pipelines a run made are listed in the cache folder; the next run makes them at the first
+/// `Present` after their shaders exist, so its draws make none (and draw the same pixels). A
+/// damaged list is skipped line by line, never a failed start.
+#[test]
+fn listed_pipelines_are_made_before_the_draws_that_need_them() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pipeline-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let present = |g: &mut Gpu| {
+        g.run(Cmd::Present {
+            device: DEVICE,
+            source: None,
+            dest: None,
+            window: 0,
+            dirty: false,
+            model: 0,
+            frame: 1,
+        });
+    };
+    let run = |cache: &std::path::Path| -> Option<(Vec<u8>, u64)> {
+        let mut g = Gpu::with_cache(4, 1, Some(cache.to_path_buf()))?;
+        present(&mut g);
+        g.colour([1.0, 0.5, 0.25, 1.0]);
+        g.clear(1, 0, 1.0);
+        g.cover(0.5);
+        let reds = g.reds();
+        let made = g.b.device().expect("the device").pipelines_made_on_draws();
+        Some((reds, made))
+    };
+    let Some((first, made_first)) = run(&dir) else {
+        return;
+    };
+    assert!(
+        made_first >= 1,
+        "the first run makes its pipeline on the draw"
+    );
+    let list = std::fs::read_to_string(dir.join("pipelines.txt")).expect("the list written");
+    assert!(list.lines().count() >= 1, "{list}");
+    let (second, made_second) = run(&dir).unwrap();
+    assert_eq!(
+        second, first,
+        "the same pixels from the pipeline made ahead"
+    );
+    assert_eq!(made_second, 0, "no pipeline made on a draw: {list}");
+    // A damaged list: the readable lines are still made ahead.
+    std::fs::write(
+        dir.join("pipelines.txt"),
+        format!("junk\n{list}p1 broken\n"),
+    )
+    .unwrap();
+    let (third, made_third) = run(&dir).unwrap();
+    assert_eq!(third, first);
+    assert_eq!(made_third, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A multisampled entry is made ahead at the run's own multisample count, whatever count it was
+/// recorded at (the shipped list is recorded at one antialiasing setting): the list a 4x run
+/// wrote leaves an 8x run no pipeline to make on its draws, and the same pixels as an 8x run
+/// without a list.
+#[test]
+fn a_list_recorded_at_4x_serves_a_run_at_8x() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pipeline-list-8x-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |samples: u32, cache: Option<&std::path::Path>| -> Option<(Vec<u8>, u64)> {
+        let mut g = Gpu::with_cache(4, samples, cache.map(std::path::Path::to_path_buf))?;
+        g.run(Cmd::Present {
+            device: DEVICE,
+            source: None,
+            dest: None,
+            window: 0,
+            dirty: false,
+            model: 0,
+            frame: 1,
+        });
+        g.colour([1.0, 0.5, 0.25, 1.0]);
+        g.clear(1, 0, 1.0);
+        g.cover(0.5);
+        let reds = g.reds();
+        let made = g.b.device().expect("the device").pipelines_made_on_draws();
+        Some((reds, made))
+    };
+    let Some((_, made_4x)) = run(4, Some(&dir)) else {
+        return;
+    };
+    assert!(made_4x >= 1, "the 4x run makes its pipeline on the draw");
+    let list = std::fs::read_to_string(dir.join("pipelines.txt")).expect("the list written");
+    let (plain, _) = run(8, None).unwrap();
+    let (listed, made_8x) = run(8, Some(&dir)).unwrap();
+    assert_eq!(made_8x, 0, "the 8x run makes no pipeline on a draw: {list}");
+    assert_eq!(listed, plain, "the same pixels as an 8x run without a list");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two triangles (a triangle list) covering clip x from `x0` to `x1` and every row, at depth 0.5.
+fn rect(x0: f32, x1: f32) -> Vec<f32> {
+    let (y0, y1) = (-3.0, 3.0);
+    vec![
+        x0, y0, 0.5, 1.0, x0, y1, 0.5, 1.0, x1, y0, 0.5, 1.0, //
+        x1, y0, 0.5, 1.0, x0, y1, 0.5, 1.0, x1, y1, 0.5, 1.0,
+    ]
+}
+
+/// On a 4 by 4 target: the left two columns red, the right two green, nothing else.
+fn left_red_right_green(g: &mut Gpu, what: &str) {
+    let px = g.pixels();
+    for (i, p) in px.iter().enumerate() {
+        let want = if i % 4 < 2 {
+            [0, 0, 255, 255]
+        } else {
+            [0, 255, 0, 255]
+        };
+        assert_eq!(*p, want, "{what}: pixel {i} of {px:?}");
+    }
+}
+
+/// Uploads into a buffer the open batch already draws from, with no Present or read-back between
+/// them: each draw reads the bytes uploaded before it, not those uploaded after it, and an upload
+/// after the last draw changes nothing drawn. The vertices: the left half uploaded at offset 0
+/// and drawn red, the right half uploaded at the same offset and drawn green, then the whole
+/// target uploaded there with no draw. The indices: the same with an index buffer rewritten
+/// between two `DrawIndexedPrimitive`s over one vertex buffer that holds all three rectangles.
+/// Copies that landed before every draw would make the target all green; copies dropped would
+/// leave the right half black.
+#[test]
+fn each_draw_reads_the_upload_before_it_in_one_batch() {
+    let Some(mut g) = Gpu::new(4, 1) else { return };
+    // Clip x of the pixel centres (Direct3D 9's whole coordinates): -1, -0.5, 0, 0.5; the
+    // halves meet at -0.25, between the second and third column.
+    let (left, right, whole) = (rect(-3.0, -0.25), rect(-0.25, 3.0), rect(-3.0, 3.0));
+    const VB2: u32 = 0x1600;
+    const VB3: u32 = 0x1610;
+    const IB: u32 = 0x1620;
+    for (buffer, index, length, format) in [
+        (VB2, false, 96, 0),
+        (VB3, false, 288, 0),
+        (IB, true, 12, 101),
+    ] {
+        g.run(Cmd::CreateBuffer {
+            device: DEVICE,
+            buffer,
+            index,
+            length,
+            usage: 0,
+            format,
+            pool: 1,
+        });
+    }
+    let upload = |g: &mut Gpu, buffer: u32, data: &[u8]| {
+        g.run(Cmd::UploadBuffer {
+            buffer,
+            offset: 0,
+            flags: 0,
+            data: Data::Bytes(data),
+        });
+    };
+    // Vertices.
+    g.clear(3, 0, 1.0);
+    g.run(Cmd::SetStreamSource {
+        device: DEVICE,
+        stream: 0,
+        buffer: VB2,
+        offset: 0,
+        stride: 16,
+    });
+    g.colour([1.0, 0.0, 0.0, 1.0]);
+    upload(&mut g, VB2, &floats(&left));
+    g.run(Cmd::DrawPrimitive {
+        device: DEVICE,
+        kind: 4,
+        start: 0,
+        count: 2,
+    });
+    g.colour([0.0, 1.0, 0.0, 1.0]);
+    upload(&mut g, VB2, &floats(&right));
+    g.run(Cmd::DrawPrimitive {
+        device: DEVICE,
+        kind: 4,
+        start: 0,
+        count: 2,
+    });
+    upload(&mut g, VB2, &floats(&whole));
+    left_red_right_green(&mut g, "vertices");
+    // Indices: one vertex buffer with the three rectangles (vertices 0-5, 6-11, 12-17).
+    let all: Vec<f32> = [left, right, whole].concat();
+    upload(&mut g, VB3, &floats(&all));
+    g.clear(3, 0, 1.0);
+    g.run(Cmd::SetStreamSource {
+        device: DEVICE,
+        stream: 0,
+        buffer: VB3,
+        offset: 0,
+        stride: 16,
+    });
+    g.run(Cmd::SetIndices {
+        device: DEVICE,
+        buffer: IB,
+    });
+    let indices =
+        |first: u16| -> Vec<u8> { (first..first + 6).flat_map(u16::to_le_bytes).collect() };
+    let draw = |g: &mut Gpu| {
+        g.run(Cmd::DrawIndexedPrimitive {
+            device: DEVICE,
+            kind: 4,
+            base_vertex: 0,
+            min_index: 0,
+            vertices: 18,
+            start_index: 0,
+            count: 2,
+        });
+    };
+    g.colour([1.0, 0.0, 0.0, 1.0]);
+    upload(&mut g, IB, &indices(0));
+    draw(&mut g);
+    g.colour([0.0, 1.0, 0.0, 1.0]);
+    upload(&mut g, IB, &indices(6));
+    draw(&mut g);
+    upload(&mut g, IB, &indices(12));
+    left_red_right_green(&mut g, "indices");
+    assert_eq!(g.b.device().map(|d| d.wgpu_errors()), Some(0));
+}
+
+/// Bindings skip looking an object up when the same handle is bound again; an object destroyed
+/// and made again at a bound handle is looked up again all the same. Bound to the same handles
+/// with the same offset and stride: a vertex buffer, an index buffer and a pixel shader, each
+/// made again with other contents. Planted bugs it catches: any of the three not looked up again.
+#[test]
+fn a_handle_made_again_while_bound_is_looked_up_again() {
+    let Some(mut g) = Gpu::new(4, 1) else { return };
+    const VB2: u32 = 0x1700;
+    const IB: u32 = 0x1710;
+    let make = |g: &mut Gpu, buffer: u32, index: bool, data: &[u8]| {
+        g.run(Cmd::CreateBuffer {
+            device: DEVICE,
+            buffer,
+            index,
+            length: data.len() as u32,
+            usage: 0,
+            format: if index { 101 } else { 0 },
+            pool: 1,
+        });
+        g.run(Cmd::UploadBuffer {
+            buffer,
+            offset: 0,
+            flags: 0,
+            data: Data::Bytes(data),
+        });
+    };
+    let bind = |g: &mut Gpu| {
+        g.run(Cmd::SetStreamSource {
+            device: DEVICE,
+            stream: 0,
+            buffer: VB2,
+            offset: 0,
+            stride: 16,
+        });
+        g.run(Cmd::SetIndices {
+            device: DEVICE,
+            buffer: IB,
+        });
+        g.run(Cmd::SetShader {
+            device: DEVICE,
+            pixel: true,
+            shader: PS,
+        });
+    };
+    let draw = |g: &mut Gpu| {
+        g.run(Cmd::DrawIndexedPrimitive {
+            device: DEVICE,
+            kind: 4,
+            base_vertex: 0,
+            min_index: 0,
+            vertices: 12,
+            start_index: 0,
+            count: 2,
+        });
+    };
+    let indices =
+        |first: u16| -> Vec<u8> { (first..first + 6).flat_map(u16::to_le_bytes).collect() };
+    // Each piece made again so that only the new one draws the right half: a stale vertex buffer
+    // (or index buffer) would draw an off-target rectangle, a stale pixel shader red.
+    let off = rect(5.0, 6.0);
+    // c0 red, c1 green; the left half drawn with the first objects.
+    let regs = floats(&[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    g.run(Cmd::SetConstants {
+        device: DEVICE,
+        kind: 3,
+        start: 0,
+        count: 2,
+        data: Data::Bytes(&regs),
+    });
+    g.clear(3, 0, 1.0);
+    make(
+        &mut g,
+        VB2,
+        false,
+        &floats(&[rect(-3.0, -0.25), off.clone()].concat()),
+    );
+    make(&mut g, IB, true, &indices(0));
+    bind(&mut g);
+    draw(&mut g);
+    // Each destroyed and made again at its handle: the right half in the second six vertices,
+    // indices of those, a pixel shader writing c1.
+    for h in [VB2, IB, PS] {
+        g.run(Cmd::Destroy { object: h });
+    }
+    make(
+        &mut g,
+        VB2,
+        false,
+        &floats(&[off, rect(-0.25, 3.0)].concat()),
+    );
+    make(&mut g, IB, true, &indices(6));
+    let mut ps = vec![0xFFFF_0300];
+    ps.extend(ins(1, &[0x800F_0800, 0xA0E4_0001]));
+    ps.push(END);
+    let t = words(&ps);
+    g.run(Cmd::CreateShader {
+        device: DEVICE,
+        shader: PS,
+        pixel: true,
+        tokens: Data::Bytes(&t),
+    });
+    bind(&mut g);
+    draw(&mut g);
+    left_red_right_green(&mut g, "made again");
+    assert_eq!(g.b.device().map(|d| d.wgpu_errors()), Some(0));
+}
+
+/// With the answers board (the render thread's way to the game's threads), the backend posts each
+/// occlusion count once the GPU has it, through its idle work alone: the same count a reader that
+/// waits gets, for the game's last `END` of the query only; an event query gets none.
+#[test]
+fn occlusion_counts_are_posted_for_reading_without_waiting() {
+    let Some(mut g) = Gpu::new(4, 4) else { return };
+    let answers = std::sync::Arc::new(d3d9_wgpu::QueryAnswers::default());
+    g.b.answer_to(std::sync::Arc::clone(&answers));
+    g.colour([1.0, 0.0, 0.0, 1.0]);
+    g.clear(3, 0, 1.0);
+    for (q, kind) in [(0x2000, 9), (0x2010, 8)] {
+        g.run(Cmd::CreateQuery {
+            device: DEVICE,
+            query: q,
+            kind,
+        });
+    }
+    let posted = |g: &mut Gpu, ends: u64| {
+        let start = std::time::Instant::now();
+        loop {
+            let more = g.b.idle();
+            let a = answers.get(0x2000).expect("made");
+            if let (true, Some(n)) = (a.ends == ends, a.count) {
+                return n;
+            }
+            assert!(more, "nothing awaited, nothing posted: {a:?}");
+            assert!(start.elapsed().as_secs() < 10, "not posted: {a:?}");
+            std::thread::sleep(d3d9_stream::IDLE_POLL);
+        }
+    };
+    // The whole 4 by 4 target in front of the cleared depth: 16 pixels, 4 samples each.
+    g.run(Cmd::QueryIssue {
+        query: 0x2000,
+        flags: 2,
+    });
+    g.cover(0.5);
+    g.run(Cmd::QueryIssue {
+        query: 0x2000,
+        flags: 1,
+    });
+    assert_eq!(posted(&mut g, 1), 64);
+    assert!(!g.b.idle(), "nothing awaited once posted");
+    // A second END: its own count; the reader that waits agrees.
+    g.clear(2, 0, 1.0);
+    let waited = g.count(0x2000, |g| g.cover(0.25));
+    assert_eq!(posted(&mut g, 2), waited);
+    // An event query is the model's: no answer posted for it.
+    g.run(Cmd::QueryIssue {
+        query: 0x2010,
+        flags: 1,
+    });
+    let event = answers.get(0x2010).expect("made");
+    assert!(!event.occlusion && event.count.is_none(), "{event:?}");
+}
+
+/// One pass of far more draws than an encoder takes before it goes to a finishing thread
+/// (`SPLIT_DRAWS`, 256), each covering the target: every draw counted exactly once across the
+/// encoders (an occlusion count spanning all of them), and the last draw's colour on top (their
+/// order kept), with each draw's vertices uploaded into the same buffer as the batch goes on.
+#[test]
+fn draws_split_across_finished_encoders_keep_their_order_and_count() {
+    let Some(mut g) = Gpu::new(4, 1) else { return };
+    g.run(Cmd::CreateQuery {
+        device: DEVICE,
+        query: 0x2000,
+        kind: 9,
+    });
+    g.state(ZFUNC, 8);
+    g.clear(3, 0, 1.0);
+    let n = 600u32;
+    let colour = |i: u32| {
+        [
+            (i % 7) as f32 / 6.0,
+            (i % 5) as f32 / 4.0,
+            (i % 3) as f32 / 2.0,
+            1.0,
+        ]
+    };
+    let count = g.count(0x2000, |g| {
+        for i in 0..n {
+            g.colour(colour(i));
+            g.cover(0.5);
+        }
+    });
+    assert_eq!(count, n * 16, "every draw counted once");
+    let last = colour(n - 1).map(|c| (c * 255.0).round() as u8);
+    for p in g.pixels() {
+        assert_eq!(p, [last[2], last[1], last[0], 255], "the last draw on top");
+    }
+    assert_eq!(g.b.device().map(|d| d.wgpu_errors()), Some(0));
+}
+
+/// The cuts between finished encoders keep what a multisampled target and its depth hold: with a
+/// real depth test (LESSEQUAL), 300 draws at depth 0.25 in red, then 600 at depth 0.75 in green
+/// that cross two cuts (every 256 draws). Only the red draws pass, so the count over all of them
+/// is the red draws' samples and every resolved pixel is red; a cut that cleared or dropped the
+/// colour or the depth (of any sample) would let green through or leave a pixel black.
+#[test]
+fn cuts_between_finished_encoders_keep_multisampled_colour_and_depth() {
+    for samples in [1u32, 4, 8] {
+        let Some(mut g) = Gpu::new(4, samples) else {
+            return;
+        };
+        g.run(Cmd::CreateQuery {
+            device: DEVICE,
+            query: 0x2000,
+            kind: 9,
+        });
+        g.state(ZFUNC, 4);
+        g.clear(3, 0, 1.0);
+        let count = g.count(0x2000, |g| {
+            g.colour([1.0, 0.0, 0.0, 1.0]);
+            for _ in 0..300 {
+                g.cover(0.25);
+            }
+            g.colour([0.0, 1.0, 0.0, 1.0]);
+            for _ in 0..600 {
+                g.cover(0.75);
+            }
+        });
+        assert_eq!(
+            count,
+            300 * 16 * samples,
+            "{samples} samples: only the red draws pass"
+        );
+        for p in g.pixels() {
+            assert_eq!(p, [0, 0, 255, 255], "{samples} samples: red everywhere");
+        }
+        assert_eq!(g.b.device().map(|d| d.wgpu_errors()), Some(0));
     }
 }

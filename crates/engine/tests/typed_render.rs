@@ -308,6 +308,23 @@ impl Common for Diff {
             .family(&pathing::PATHING)
             .family(&culling::CULLING)
             .family(&crt::CRT)
+            // The draw family's skinned packer and strip lists, which the packing calls: stood in here, run
+            // in the draw family's tests below; its D3DX thunks, which the shader and dispatch families call.
+            .goes_by_address(&[
+                0x00e6_d780,
+                0x00a7_5f10,
+                0x00ee_6dfe,
+                0x00ee_6dec,
+                0x00ee_6df2,
+                0x00ee_6df8,
+                0x00ee_6dd4,
+                0x00ee_6dda,
+                0x00ee_6de0,
+                0x00ee_6dce,
+                0x00ee_6dc8,
+            ])
+            // draw_f's helpers: off until its gate, so by address, as in play; run in typed_draw.
+            .goes_by_address(DRAW_F_HELPERS)
             .max_calls(MAX_CALLS)
             .max_cases(200);
         if real_shader {
@@ -319,6 +336,10 @@ impl Common for Diff {
 }
 
 const TWO_WAYS: &[u32] = &[0, 1];
+
+/// draw_f's helpers (`engine_typed::draw_f`): the float maximum and minimum, the class test, the list
+/// node pool's allocation.
+const DRAW_F_HELPERS: &[u32] = &[0x0040_4010, 0x0040_ebd0, 0x0043_b300, 0x0043_a010];
 
 #[test]
 fn bind() {
@@ -1301,4 +1322,32 @@ fn tri_strips_draw_through_the_typed_slot() {
     })
     .run()
     .assert_same();
+}
+
+/// `draw_packed` with the data's slot 0x90 holding the draw family's vertex count (`00a669e0`): the
+/// call made direct; with vertices and without.
+#[test]
+fn draw_packed_typed_vertex_count() {
+    Diff::new(entry!(0x00e7_4840, draw::draw_packed(Ptr, Ptr)))
+        .common(false)
+        .family(&engine_typed::draw::DRAW)
+        .inputs(&[
+            Input::Of(&[
+                DRAW_INDEXED,
+                DRAW_SKIN | DRAW_LENGTHS,
+                DRAW_INDEXED | DRAW_LENGTHS,
+            ]),
+            Input::Of(&[1, 2]),
+            Input::Of(&[0x20, 0]),
+        ])
+        .setup(|e, c| {
+            let d = drawn(e, c.word(0), c.word(1), 2, 0x3f80_0000);
+            let data = e.mem.u32(d.geometry + 0xb8);
+            let vt = vtable(e, &[(0x90, 0x00a6_69e0)]);
+            set(e, data, vt);
+            e.mem.set_u16(data + 8, c.word(2) as u16);
+            vec![d.renderer, d.geometry]
+        })
+        .run()
+        .assert_same();
 }

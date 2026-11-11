@@ -11,16 +11,30 @@
 //! - `format`: `D3DFORMAT` to wgpu formats.
 //! - `state`: render and sampler states to wgpu states.
 //! - `device`: resources, passes, pipelines, draws and `Present`.
+//! - `window`: the game's window: the swap chain at the window's size, minimised, sized or lost.
 //! - `shot`: `NV_SHOT` captures numbered like the forwarding layer's.
 
+mod answers;
+mod cache;
 pub mod device;
 pub mod format;
+mod fxhash;
+pub mod loading;
+mod prepare;
 pub mod shot;
 pub mod sm;
 pub mod state;
+mod window;
 
+/// Writes every live wgpu device's pipeline cache and pipeline list now, when they changed: for
+/// the end of the run (the host's exit hooks; the process ends with `std::process::exit`).
+pub fn save_pipeline_caches() {
+    cache::save_all_now();
+    device::save_lists_now();
+}
+pub use answers::{Answer, QueryAnswers};
 use d3d9_stream::{Backend, Cmd, Data, Handle, Reply};
-pub use device::Output;
+pub use device::{hardware_adapter, Output};
 
 /// The Direct3D 9 calls carried out on wgpu.
 pub struct WgpuBackend {
@@ -28,6 +42,10 @@ pub struct WgpuBackend {
     device: Option<device::Device>,
     /// The handle of the game's device (one is made).
     game_device: Handle,
+    /// Where the driver's compiled pipelines are kept between runs ([`WgpuBackend::with_cache_dir`]).
+    cache_dir: Option<std::path::PathBuf>,
+    /// Where occlusion counts are posted for the game's threads ([`WgpuBackend::with_answers`]).
+    answers: Option<std::sync::Arc<QueryAnswers>>,
 }
 
 impl WgpuBackend {
@@ -38,7 +56,33 @@ impl WgpuBackend {
             output,
             device: None,
             game_device: 0,
+            cache_dir: None,
+            answers: None,
         }
+    }
+
+    /// Keeps the driver's compiled pipelines in `dir` between runs, where the backend has a
+    /// pipeline cache (Vulkan): read when the device is made, written after new pipelines
+    /// (`cache.rs`). The host chooses the folder; without one nothing is read or written.
+    pub fn with_cache_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.cache_dir = Some(dir);
+        self
+    }
+
+    /// Posts each occlusion count to `answers` once the GPU has it, for the game's threads to
+    /// read without waiting for the render thread ([`QueryAnswers`]).
+    pub fn with_answers(mut self, answers: std::sync::Arc<QueryAnswers>) -> Self {
+        self.answer_to(answers);
+        self
+    }
+
+    /// [`WgpuBackend::with_answers`] on a backend that may have made its device already: the
+    /// queries made from now on are posted.
+    pub fn answer_to(&mut self, answers: std::sync::Arc<QueryAnswers>) {
+        if let Some(d) = self.device.as_mut() {
+            d.answers = Some(std::sync::Arc::clone(&answers));
+        }
+        self.answers = Some(answers);
     }
 
     /// The wgpu device, once the game made its own.
@@ -80,8 +124,10 @@ impl Backend for WgpuBackend {
                 &pp,
                 &handles(back_buffers),
                 *depth_stencil,
+                self.cache_dir.as_deref(),
             ) {
-                Ok(d) => {
+                Ok(mut d) => {
+                    d.answers = self.answers.clone();
                     self.device = Some(d);
                     self.game_device = *device;
                     // No D3DX side channel: the texture loader cannot use a wgpu device.
@@ -153,7 +199,7 @@ impl Backend for WgpuBackend {
                 count,
                 data,
                 ..
-            } => d.set_constants(kind, start, count, &data.to_words()),
+            } => d.set_constants(kind, start, count, &data),
             Cmd::SetStreamSource {
                 stream,
                 buffer,
@@ -306,5 +352,11 @@ impl Backend for WgpuBackend {
             | Cmd::SetLod { .. } => {}
         }
         Reply::None
+    }
+
+    /// The awaited occlusion counts polled and posted ([`QueryAnswers`]); more turns while any is
+    /// still on the GPU.
+    fn idle(&mut self) -> bool {
+        self.device.as_mut().is_some_and(device::Device::idle)
     }
 }

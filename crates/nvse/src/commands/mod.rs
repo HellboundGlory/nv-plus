@@ -3,16 +3,25 @@
 
 pub mod algohol;
 pub mod array;
+pub mod extender;
+pub mod factions;
+pub mod game;
 pub mod input;
 pub mod inventory;
 pub mod inventory_forms;
 pub mod inventory_info;
 pub mod inventory_items;
 pub mod inventory_ref;
+pub mod list;
 pub mod math;
+pub mod misc;
+pub mod misc_forms;
 pub mod misc_ref;
+pub mod misc_ref_cells;
+pub mod misc_ref_more;
 pub mod misc_ref_npc;
 pub mod printf;
+pub mod quest;
 pub mod scripting;
 pub mod string;
 pub mod weapons;
@@ -24,14 +33,23 @@ use engine_core::prelude::*;
 
 /// Every built command, for [`crate::table::install`].
 pub fn all() -> Vec<&'static Command> {
-    inventory::COMMANDS
+    extender::COMMANDS
         .iter()
+        .chain(inventory::COMMANDS)
         .chain(inventory_ref::COMMANDS)
         .chain(inventory_forms::COMMANDS)
         .chain(inventory_items::COMMANDS)
         .chain(inventory_info::COMMANDS)
         .chain(misc_ref::COMMANDS)
         .chain(misc_ref_npc::COMMANDS)
+        .chain(misc_ref_cells::COMMANDS)
+        .chain(misc_ref_more::COMMANDS)
+        .chain(misc::COMMANDS)
+        .chain(misc_forms::COMMANDS)
+        .chain(list::COMMANDS)
+        .chain(factions::COMMANDS)
+        .chain(quest::COMMANDS)
+        .chain(game::COMMANDS)
         .chain(weapons::COMMANDS)
         .chain(math::COMMANDS)
         .chain(algohol::COMMANDS)
@@ -90,6 +108,28 @@ impl Read {
             .map(<[u8]>::to_vec)
             .unwrap_or_default()
     }
+}
+
+/// String argument `i` as a command holds it when xNVSE's reader copies it into a `size`-byte
+/// buffer on the command's stack: its text up to the first 0. The reader writes the compiled
+/// string's bytes and a 0, then a `$` variable's whole text and its 0 (`v_ExtractArgsEx`), so an
+/// argument of `size` bytes or more runs past the buffer into the command's frame. With the list
+/// guard row (`NV_NVSE_LIST_GUARD`) the text is used whole; off (vanilla) the port stops the game
+/// there: one rule for every such buffer (the coordinator's, from the review of #415), since
+/// xNVSE's answer past the buffer depends on what its frame holds there, and no script means to
+/// give such a name.
+pub fn arg_in_buffer(e: &Engine, read: &Read, i: usize, size: usize, command: &str) -> Vec<u8> {
+    let written = match read.args.get(i) {
+        Some(Arg::Str { raw, text }) => raw.len().max(text.len()),
+        _ => 0,
+    };
+    if written >= size && !array::fix_on(e, array::LIST_GUARD) {
+        panic!(
+            "{command}: a text of {written} bytes runs past xNVSE's {size}-byte buffer into its \
+             frame: the port stops here (NV_NVSE_LIST_GUARD reads it whole)"
+        );
+    }
+    string::c_str(&read.text(i)).to_vec()
 }
 
 /// The form a base-form command works on: the given form's base form when it is a reference
@@ -163,6 +203,18 @@ pub mod rtti {
     pub const TES_NPC: u32 = 0x0118_3a1c;
     pub const TES_EYES: u32 = 0x0118_6388;
     pub const TES_HAIR: u32 = 0x0118_63a0;
+    pub const TES_FACTION: u32 = 0x0118_4704;
+    pub const TES_ACTOR_BASE_DATA: u32 = 0x0118_6cb4;
+    pub const TES_OBJECT_LIGH: u32 = 0x0118_3938;
+    pub const BS_TEMP_EFFECT: u32 = 0x0119_c08c;
+    pub const MAGIC_SHADER_HIT_EFFECT: u32 = 0x011a_12c4;
+    pub const BGS_PERK: u32 = 0x0118_61dc;
+    pub const TES_LEV_CREATURE: u32 = 0x0118_9c10;
+    pub const TES_LEV_CHARACTER: u32 = 0x0118_a280;
+    pub const TES_OBJECT_DOOR: u32 = 0x0118_6530;
+    pub const TES_PACKAGE: u32 = 0x0118_46a0;
+    pub const TES_CREATURE: u32 = 0x0118_3a00;
+    pub const BGS_HEAD_PART: u32 = 0x0118_63b8;
 }
 
 /// `DYNAMIC_CAST(obj, from, to)` (xNVSE): the exe's `__RTDynamicCast`; 0 for a null object or
@@ -243,21 +295,77 @@ pub fn double_words(v: f64) -> [u32; 2] {
 pub(crate) mod test_support {
     use super::*;
 
-    /// A fake `__RTDynamicCast`: an object whose word at `+0x7f0` lists (as a bit per class
-    /// below) what it is answers the cast to those classes, at the class's place in it
-    /// ([`component`]).
+    /// A fake `__RTDynamicCast`: an object whose two words at `+0x7f0` and `+0x7f4` list (as a
+    /// bit per class below, the first word's 32 classes then the second's) what it is answers the
+    /// cast to those classes, at the class's place in it ([`component`]).
     pub fn fake_cast(e: &mut Engine, a: &[u32]) -> Ret {
         let (object, to) = (a[0], a[3]);
         let (bit, at) = component(to);
-        let is = e.mem.u32(object + 0x7f0) & bit != 0;
+        let is = classes(e, object) & bit != 0;
         Ret {
             eax: if is { object + at } else { 0 },
             ..Ret::default()
         }
     }
 
+    /// The classes [`fake_cast`] reads for `object`: the word at `+0x7f0`, then the one at
+    /// `+0x7f4` as bits 32 to 63.
+    pub fn classes(e: &Engine, object: u32) -> u64 {
+        u64::from(e.mem.u32(object + 0x7f0)) | u64::from(e.mem.u32(object + 0x7f4)) << 32
+    }
+
+    /// Makes `object` answer the casts of `bits` (both words; see [`fake_cast`]).
+    pub fn set_classes(e: &mut Engine, object: u32, bits: u64) {
+        e.mem.set_u32(object + 0x7f0, bits as u32);
+        e.mem.set_u32(object + 0x7f4, (bits >> 32) as u32);
+    }
+
     /// The fake cast's bit for a class and where the class lies in an object.
-    pub fn component(rtti: u32) -> (u32, u32) {
+    pub fn component(rtti: u32) -> (u64, u32) {
+        let (bit, at) = component_low(rtti);
+        if bit != 0 {
+            return (u64::from(bit), at);
+        }
+        component_high(rtti)
+    }
+
+    /// The classes of the second word (bits 32 and up), added when the first ran out.
+    fn component_high(rtti: u32) -> (u64, u32) {
+        match rtti {
+            rtti::TES_FACTION => (1 << 32, 0),
+            rtti::TES_ACTOR_BASE_DATA => (1 << 33, 0x30),
+            rtti::TES_OBJECT_LIGH => (1 << 34, 0),
+            rtti::MAGIC_SHADER_HIT_EFFECT => (1 << 35, 0),
+            rtti::BGS_PERK => (1 << 36, 0),
+            rtti::TES_LEV_CREATURE => (1 << 37, 0),
+            rtti::TES_LEV_CHARACTER => (1 << 38, 0),
+            rtti::TES_OBJECT_DOOR => (1 << 39, 0),
+            rtti::TES_PACKAGE => (1 << 40, 0),
+            rtti::TES_CREATURE => (1 << 41, 0),
+            rtti::BGS_HEAD_PART => (1 << 42, 0),
+            _ => (0, 0),
+        }
+    }
+
+    /// A class of the second word is cast only from the second word, at its own place; the first
+    /// word's bits do not answer it.
+    #[test]
+    fn the_second_word_answers_its_own_classes() {
+        let mut e = engine();
+        let form = 0x0200_1000;
+        set_classes(&mut e, form, u64::MAX >> 32);
+        let cast = |e: &mut Engine, to| dynamic_cast(e, form, rtti::TES_FORM, to);
+        assert_eq!(cast(&mut e, rtti::TES_ACTOR_BASE_DATA), 0);
+        assert_eq!(cast(&mut e, rtti::TES_HAIR), form);
+        set_classes(&mut e, form, 1 << 33);
+        assert_eq!(cast(&mut e, rtti::TES_ACTOR_BASE_DATA), form + 0x30);
+        assert_eq!(cast(&mut e, rtti::TES_FACTION), 0);
+        assert_eq!(cast(&mut e, rtti::TES_OBJECT_REFR), 0);
+        assert_eq!(classes(&e, form), 1 << 33);
+    }
+
+    /// The classes of the first word.
+    fn component_low(rtti: u32) -> (u32, u32) {
         match rtti {
             rtti::TES_OBJECT_REFR => (1, 0),
             rtti::TES_WEIGHT_FORM => (2, 0x100),

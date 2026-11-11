@@ -96,13 +96,16 @@ The game's own `iFPSClamp` ignores `FrameLimit`: a clamp is a fixed step with no
 | Co-save keeps other plugins | none (a flag the extender reads) | `NV_COSAVE_KEEP` | A co-save's sections of plugins that are not built in (JIP LN NVSE's, until it is) are kept as they were read and written back on each save while the files loaded are the ones that co-save lists, so a save brought from a real modded installation keeps them. xNVSE writes only the plugins it has loaded, so off (vanilla) they go at the next save, as with xNVSE. Below |
 | Script error loop guard | none (a flag the extender reads) | `NV_NVSE_ERROR_GUARD` | An error raised while a script's `RuntimeScriptError` handler runs (in the handler itself, or at the call depth limit when handlers call functions that fail) is not sent to the handlers again. xNVSE sends it again, which recurses until the stack runs out and the game stops; off (vanilla), the port does the same. Below |
 | Image-space event form check | none (a flag the extender reads) | `NV_NVSE_IMOD_CHECK` | When an image-space modifier instance runs out, OnRemoveIMOD is raised only for an instance of a modifier form (the game's own `AsForm` test, as its `Stop` makes it), with that form. xNVSE reads a form at the same place in every instance, and a depth-of-field or radial blur instance (iron sights, V.A.T.S., `SetGlobalRadialBlur`) has a number there: a handler then reads garbage as a form. Off (vanilla), the word is read as xNVSE reads it, and a word that is not a readable form drops the event instead of stopping the game. Below |
-| Script reference checks | none (a flag the extender reads) | `NV_NVSE_INVREF_CHECK` | (Once "Inventory reference checks": the variable and the Fallout.ini key `bNVSEInvRefCheck` keep that name, so a setting already made still works.) A reference handed to a script with parts missing, where xNVSE reads or writes through the missing part and the game stops; with the row the command gives its "nothing" answer instead (0, or nothing set). Off (vanilla), the port stops there too. **Inventory references:** an inventory reference's temporary reference is in no cell, and has no base form once released (after `RemoveMeIR`, or a loop's reference kept past its loop): `GetDoorTeleportX`, `GetDoorTeleportY`, `GetDoorTeleportZ`, `GetDoorTeleportRot`, `SetDoorTeleport`, `GetParentCellOwner` and `GetParentCellOwningFactionRequiredRank` read through the missing base form or cell. A container whose base list has an entry without a form stops the game in `ForEach` and `GetInventoryItems` (xNVSE reads the missing form's type), where the row passes over it; the commands that look an item up by its id (`PickOneOf`, `GetTokenValue` and the rest) read its id through it, where the row takes it as another item (`GetNumItems` and `GetInventoryObject` count it as xNVSE does, in both presets). **Doors:** a door whose teleport has no data or no linked door, or whose lock has no data (a mod's broken door data; the game itself makes a lock without data only when an allocation fails, and never a teleport without data): `GetLinkedDoor` reads through it, `SetDoorTeleport` and `SetOpenKey` write through it. **And two of xNVSE's own slips with inventory references:** `RemoveMeIR` on an unworn stack with data of its own (a weapon with its condition) frees that data through the entry the reference holds, which for a reference from `GetInvRefsForItem`, `ForEach`, OnSell or OnRepair is the reference's own copy: the container's entry keeps the freed data and its count, so the item stays with freed memory as its data; with the row the data leaves the container's own entry too (its count with it) before it is freed, and nothing is freed when no entry of the container holds it. OnSell's item stays kept after the event when no handler ran (every handler filtered out), so a later `GetSoldItemInvRef` reads a sale that is over; with the row it goes when the event ends. Off (vanilla), all of these are xNVSE's, the stops included. Below |
+| Script reference checks | none (a flag the extender reads) | `NV_NVSE_INVREF_CHECK` | (Once "Inventory reference checks": the variable and the Fallout.ini key `bNVSEInvRefCheck` keep that name, so a setting already made still works.) A reference handed to a script with parts missing, where xNVSE reads or writes through the missing part and the game stops; with the row the command gives its "nothing" answer instead (0, or nothing set). Off (vanilla), the port stops there too. **Inventory references:** an inventory reference's temporary reference is in no cell, and has no base form once released (after `RemoveMeIR`, or a loop's reference kept past its loop): `GetDoorTeleportX`, `GetDoorTeleportY`, `GetDoorTeleportZ`, `GetDoorTeleportRot`, `SetDoorTeleport`, `GetParentCellOwner` and `GetParentCellOwningFactionRequiredRank` read through the missing base form or cell. A container whose base list has an entry without a form stops the game in `ForEach` and `GetInventoryItems` (xNVSE reads the missing form's type), where the row passes over it; the commands that look an item up by its id (`PickOneOf`, `GetTokenValue` and the rest) read its id through it, where the row takes it as another item (`GetNumItems` and `GetInventoryObject` count it as xNVSE does, in both presets). **Doors:** a door whose teleport has no data or no linked door, or whose lock has no data (a mod's broken door data; the game itself makes a lock without data only when an allocation fails, and never a teleport without data): `GetLinkedDoor` reads through it, `SetDoorTeleport` and `SetOpenKey` write through it. **Owners and cell scans:** `HasOwnership` and `IsOwned` read the item's parent cell (for the cell's owner) and the asker's base form through nothing for a reference without them, where the row answers 0; the cell scans read a cell reference's base form for its type, where the row passes over a reference without one. **Scan records:** `GetNextRef` with no scan reports "GetFirstRef MUST be called before GetNextRef" and leaves a record it never builds, and a second one reads that record's uninitialised memory; a console scan that has ended stays under the console's key (xNVSE drops the script's own id instead), and the next console `GetNextRef` reads it through its missing cell. With the row both answer as the first call did: the error line again and 0. A scan whose walk finds no cell of its area in the worldspace's map reads the missing cell's list too; with the row it answers 0. **Form lists and doors** (`Commands_Misc.cpp`): `GetDoorSound` reads the id of the door's open or close sound through nothing for a door record without that sound (the game allows one), and in the console prints the id of a missing form through nothing; `GetLevCreatureRefs` and `GetLevCharacterRefs` read the id of a leveled entry's missing form; `GenericCheckForm` reads the id of an empty node's missing form in the middle of the list. With the row the door answers 0 and nothing is printed, and the entry or node is passed over. `IsRefInList` (`Commands_List.cpp`) reads the id of a reference's missing base form (an inventory reference's, once released) when the list holds a form; with the row nothing is found there. **And two of xNVSE's own slips with inventory references:** `RemoveMeIR` on an unworn stack with data of its own (a weapon with its condition) frees that data through the entry the reference holds, which for a reference from `GetInvRefsForItem`, `ForEach`, OnSell or OnRepair is the reference's own copy: the container's entry keeps the freed data and its count, so the item stays with freed memory as its data; with the row the data leaves the container's own entry too (its count with it) before it is freed, and nothing is freed when no entry of the container holds it. OnSell's item stays kept after the event when no handler ran (every handler filtered out), so a later `GetSoldItemInvRef` reads a sale that is over; with the row it goes when the event ends. Off (vanilla), all of these are xNVSE's, the stops included. Below |
 | Script array and string size caps | none (a flag the extender reads) | `NV_NVSE_SIZE_CAPS` | An array `ar_Range`, `ar_Init`, `ar_Resize` or `ar_Generate` makes or grows stops at 8,388,608 elements (about 335 MB), and `sv_Replace` of an empty text a given number of times stops at 64 MiB. The keys `MenuTapKey`, `MenuHoldKey` and `MenuReleaseKey` queue for the game's buffered key reads (drained only when the game reads them, in menus) stop at 4,096; the rest are dropped. A format string the C runtime cannot make is made safely: a precision past 965,624,998 (more working memory than the runtime gets in a 32-bit process) gives a number with a point the runtime's own fallback of 163 digits and an integer the zeros asked, and a format the runtime refuses (`%Ld`, `%5n`, a second size such as `%hld`) gives an empty text. In xNVSE such an integer precision crashes the runtime, a refused format ends the game (the runtime's default invalid-parameter handler: nothing in xNVSE's process installs another, measured in the real game), and whether a number's precision gets its memory depends on the game's; off (vanilla), the port stops the game at all three. xNVSE goes on until it runs out of memory and the game stops; off (vanilla), the port stops too: an array past 33,554,432 elements or a string past 1 GiB or more than 67,108,864 queued menu keys stops the game as out of memory, about where xNVSE's 32-bit process runs out, so the computer is never asked for more. A range that never ends (a step of 0, or one that wraps past its end), `ar_Cat` of an array with itself and an empty text replaced without a count never end in xNVSE and are capped the same in both presets. Below |
 | Script missing array guard | none (a flag the extender reads) | `NV_NVSE_NULL_GUARD` | `ar_Count` and `ar_GetNth` on a missing array answer 0, and a format string's `%s` (or `%S`, `%Z`) pointing outside the game's memory ends the text. xNVSE reads through the null array or the pointer and the game stops; off (vanilla), the port does the same. Below |
 | Script array cycle guard | none (a flag the extender reads) | `NV_NVSE_CYCLE_GUARD` | A deep copy (`ar_DeepCopy`), a deep compare (`ar_DeepEquals`) or a dump (`ar_Dump`, `ar_DumpF`) of an array that holds itself, directly or through others, ends where it meets the array again: the copy holds its own copy there, the compare counts that pair as equal, the dump writes `[...]`. xNVSE walks on until the stack runs out and the game stops; off (vanilla), the port does the same. Below |
-| Script inventory list guard | none (a flag the extender reads) | `NV_NVSE_LIST_GUARD` | A game list the inventory commands walk (a container's stacks, a stack's extra data lists) that runs back into itself ends the walk after 1,048,576 nodes, and `GetPaired` ends where it would ask for the same stack again (a stack list with an empty node). xNVSE walks on for ever and the game hangs; off (vanilla), the port stops the game there instead. And two places where xNVSE itself stops the game no longer do: the extra data list `SetHotkeyItem` gives a stack that had none (stimpaks, for one) has the game's own vtable, so the game can free it when the stack is used up, dropped or the inventory torn down; the token commands (`GetTokenValue`, `GetTokenRef`, `SetTokenValue`, `SetTokenRef`, `SetTokenValueAndRef`, `GetPaired`) on an item that is in the reference's base container without a stack of its own (the player's Pip-Boy, for one) answer with that item's base health and no owner, and the setters add it and set its new stack to the value given, as they do for an item not held (except that `SetTokenRef`, which gives no value, keeps the item's base health, where xNVSE's not-held path would store 0). xNVSE's list has no vtable, and its token search reads the item's health through the missing changes entry or counts on through an index the command did not pass: the game crashes; off (vanilla), the port stops there too. Below |
+| Script list and scan guard | none (a flag the extender reads) | `NV_NVSE_LIST_GUARD` | (Once "Script inventory list guard": the variable and the Fallout.ini key `bNVSEListGuard` keep that name.) Lists and walks that cannot end are ended. A game list the inventory commands walk (a container's stacks, a stack's extra data lists), or one the form list commands walk (a form list's forms for `ListGetCount`, `ListGetFormIndex`, `IsRefInList`, `ListAddForm`, `ListRemoveForm`, `ListClear`, `ForEachInList` and the rest; the lists `GetListForms`, `GetRaceHairs` and the other array commands and the generic list commands walk), that runs back into itself ends the walk after 1,048,576 nodes, and `GetPaired` ends where it would ask for the same stack again (a stack list with an empty node). A cell scan (`GetFirstRef`, `GetNextRef`, `GetNumRefs`, `GetRefs`, their `InCell` forms, `GetInGrid`, `GetInGridInCell`) whose depth takes the walk past the cell grid's 8-bit positions (the cell's x or y plus the depth above 127, as with `GetNumRefs 0 200`, or a depth of -2, taken as 254) ends when the walk is back where it started, every cell position it can reach visited once: `GetNumRefs` and `GetRefs` give the references of the cells passed; `GetFirstRef` and `GetNextRef` go on answering the same references round and round as xNVSE does, and only a call that goes the whole way round without finding one answers 0. xNVSE walks on for ever and the game hangs; off (vanilla), the port stops the game there instead. A name xNVSE copies into a 256- or 512-byte buffer on its stack, its terminator included, is used whole with the row. `GetAgeClass`'s race name in capitals runs into the saved frame and the return address at 256 bytes or more; off (vanilla), the port stops the game there, where xNVSE faults. `AddAnimation`'s and `DelAnimation`'s name argument: off (vanilla), the port also stops at 256 bytes, which is a deviation: there `AddAnimation` in xNVSE adds the name with the bytes that follow it in its frame (an answer that depends on the run), and `DelAnimation` compares the node's index byte as the name's 257th (an answer the list fixes, kept under the same stop as one rule) and faults only from 257 or 260 bytes (`AddAnimation`, without or with a form argument) and 265 or 272 (`DelAnimation`); see below. The same rule for the 512-byte name arguments of `GetNumericGameSetting`, `SetNumericGameSetting`, `GetNumericIniSetting`, `SetNumericIniSetting`, `IsModLoaded` and `GetModIndex` (a `$` string variable's text is copied whole): off (vanilla), the port stops at 512 bytes, where `IsModLoaded` faults; the others first write their next bytes into locals (see below). And for the 256-byte plugin names of `IsPluginInstalled` and `GetPluginVersion`, where both fault (the saved frame is right above their buffers). And two places where xNVSE itself stops the game no longer do: the extra data list `SetHotkeyItem` gives a stack that had none (stimpaks, for one) has the game's own vtable, so the game can free it when the stack is used up, dropped or the inventory torn down; the token commands (`GetTokenValue`, `GetTokenRef`, `SetTokenValue`, `SetTokenRef`, `SetTokenValueAndRef`, `GetPaired`) on an item that is in the reference's base container without a stack of its own (the player's Pip-Boy, for one) answer with that item's base health and no owner, and the setters add it and set its new stack to the value given, as they do for an item not held (except that `SetTokenRef`, which gives no value, keeps the item's base health, where xNVSE's not-held path would store 0). xNVSE's list has no vtable, and its token search reads the item's health through the missing changes entry or counts on through an index the command did not pass: the game crashes; off (vanilla), the port stops there too. Below |
 | IO wait ends on completion | `00c3dfa0` | `NV_IO_WAIT` | The IO manager's wait for queued loads (`00c3dfa0`; main at a cell border, a load, a save) sleeps 50 ms a turn while the completed work is short of what is in flight, then takes what came in. Here that sleep ends as soon as it is not (looked at after each 1 ms sleep; a turn still ends after 50 ms by the clock, or after 50 looks), so the wait for queued loads ends when they are done, not at its next 50 ms step: the same work in the same order. With stepped threads each 1 ms sleep is a switch point, where the IO thread runs. `IOManager::LoadQueuedPriority` (`00456520`) calls it by address now, so the row applies there too. |
 | Half-loaded actor's level change | `00881d30`, `00882b90`, `00883240`, `00883800`, `00932a00`, `00932b70` | `NV_HALF_LOADED_MOVE` | An actor moved to another AI level while its saved data loads (one loading thread between the two passes over a cell's saved changes, another setting its animation: running fast across cells) has its saved reference ids taken out for the move and put back where the original's copy puts them, for the second pass to resolve. The original follows the saved target id as an object (marks it, then calls through the word at the id as a vtable): its own crash. Below |
+| Thread races | `00aa42e0`, `00aa3a40`, `00a0e770`, `00a0df80`, `00a0f8b0`, `0071d0a0`, `00652140`, `00652160`, `00652190` | `NV_THREAD_RACES` | Three places where the original shares state between its threads without the lock it needs, which the port meets because it runs the game's threads side by side: a new thread's scrap heap (the first look-up on a thread inserts into an unlocked map, so two threads starting at once can lose one, and a block is later freed into the wrong heap), the debug texts and the console (printed from any thread while the main thread handles and times out the same queue), and the face-gen lock's count (counted down after the release with a plain read and write, so counts are lost and the model cache is never emptied, or emptied under another thread). From lStewieAl's Tweaks. Below |
+| Texture files read before the renderer's lock | `00e6dc40` | `NV_TEXTURE_READ_FIRST` | The loading thread makes a texture's renderer data (`00e6dc40`) under the renderer's source-data lock (`m_kSourceDataCriticalSection`, the renderer's +0x180), and the making reads the texture's file and unpacks it from its archive inside that lock (`00e68a80`: `NiFile::GetFile`, `00462d80`), so main, which takes the same lock to bind or make another texture's data, waited for the read: 6-13 ms in 5-6 frames of each run across cell borders (measure/smooth-200/BORDERS.md). Here the file is read first, on the same thread with the same calls, when the texture is loaded by its file name (the common case: each making opens its own file; a texture holding a file object of its own is made as before, its file read under the lock), and only the rest stays under the lock in the exe's order: the renderer data's allocation and construction, the image description, the Direct3D texture's creation, the texture taking its data. The lock guards the textures' renderer data (+0x24) and the renderer's texture state; the read touches only the file and a buffer of its own. A texture another thread gives data meanwhile frees the buffer read for nothing (its file, opened for this making alone, is already deleted). The same textures with the same bytes, made and handed to the renderer in the same order; what differs with the row on is the guest heap's order of allocation (the file's buffer is taken before the renderer data's object), so heap addresses differ, not what is drawn. |
+| Cell entry waits for its own cell | `00446b50` | `NV_CELL_ENTRY_WAIT` | Crossing into a new outdoor cell, the game waits for the loads the new cell needs at once. The original waits for more: at the same crossing it queues the row of cells three cells ahead as a pre-load, at the same top priority, and the wait takes them too, one cell after another on the one loading thread: a wait of 45 to 82 ms for 1.5 ms of the entered cell's own loads, 68 to 150 ms with YUP. With the row the cells ahead that are still queued get the priority their references get (1 or 3, `TES::GetCellPriority`'s rule) before the wait, through the IO manager's own requeue, and load right after it, in the background. A cell load already running, and one for the entered cell itself, are waited for as before. Measured, one run each: the wait went from 82 to 20 ms in the base game and from 68 to 4 ms with YUP; the frame it falls in went from 122 to 55 ms and from 102 to 31 ms. The frames next to it keep the border's other work, so the crossing's longest frame went from 122 to 70 ms and from 102 to 65 ms: about half. Below |
 
 ### What high frame rates do to the original's code
 
@@ -262,6 +265,125 @@ then running across cells) stopped with `read of unmapped memory at 00154145 (in
   high `+0x38c`, `+0x394`, the detection states) stay in place; the first pass still writing into the
   old process while the other thread replaces it is the original's own race.
 
+### Thread races
+
+Found by lStewieAl's Tweaks (`ThreadSafeThreadScrapHeap`, `ConsolePrintMultithreadingFix`,
+`patchFixFaceGenRaceDataRace`; none of the three depends on JIP LN or JohnnyGuitar), built here from
+the exe (`crates/host/src/thread_races.rs`). In the original these are races between the game's own
+threads on Windows; the port runs those threads side by side in play (`NV_THREADS`), so it has them
+too. None has been seen in a port run: the evidence is the exe and a test with real threads
+(`crates/host/tests/thread_races.rs`).
+
+- **A new thread's scrap heap.** `MemoryManager::GetThreadScrapHeap` (`00aa42e0`) looks the calling
+  thread's id up in a map of 37 buckets; on the first call of a thread it allocates a heap and inserts
+  it with `SetAt` (`00aa4860`): read the bucket's head, link the new node in front of it, write the head
+  back. No lock. Two threads inserting into one bucket at the same moment both read the old head, and
+  one node is lost: that thread's next call makes a second heap, so a block taken from the first heap
+  is freed into the second. In the port two ids share a bucket when they differ by a multiple of 37
+  (game threads are numbered from 1, render helpers from 65,537), so it is rare today; the original's
+  Windows ids collide more often. With the row each OS thread keeps the heap it found (for its run,
+  its game thread, and until the next install or the memory manager's teardown, `00aa3a40`). The
+  exe's own look-up and insert run under one lock, with the stepped host's time slice taken out
+  around them (as the render helpers' fork does for its caller), so no turn ends while the lock is
+  held. So the map is filled as in the original, and the teardown frees every heap. A heap looked up
+  while a teardown runs is not kept. Not fixed: the teardown's own walk of the map, racing another
+  thread's first call, is the original's race and stays.
+  After its first call a thread pays one thread-local read, where the original makes an import call
+  and a map look-up through three virtual calls.
+- **The debug texts and the console.** The debug texts' queue is handled and timed out on the main
+  thread (`DebugText::HandleQueuedPrints`, `00a0e770`; `00a0df80`), which take the critical section
+  at `011f33dc` only while the debug texts are shown; `DebugText::Print` (`00a0f8b0`) and the console
+  print (`0071d0a0`, which scripts and the script extender's commands print with) take none, from any
+  thread. With the row the four run whole inside that section (it is recursive: their own takes inside
+  stay). Two differences from the plugin: the console print is wrapped whole, its log-file write
+  included, where the plugin takes the section from the line break on; and the functions' own
+  takes, made only while the debug texts show, stay, where the plugin removes them.
+- **The face-gen lock's count.** `00652140` takes the face-gen lock and counts its depth (`011d59dc`)
+  up, `00652160` tries it and counts up when it got it, `00652190` releases it and only then counts
+  down, outside the lock. A release and a take on two threads at once lose a count. The memory-freeing
+  step (`00866a90`) empties the face-gen model cache only when the depth is exactly 1 after its own
+  take: a depth that drifted up keeps the cache full for good (the plugin's author links it to endless
+  loading on some saves), one that drifted down empties it while another thread uses it. With the row
+  the counts are locked increments and decrements at the same points. Tweaks also takes the lock out
+  of three of the model map's functions (`00650200`, `00650930`, `00650ba0`); the exe gives no reason
+  why that is safe, so that part is not built.
+- **Tested.** The real-thread tests (`crates/host/tests/thread_races*.rs`) run four OS threads side
+  by side (skipped below four cores): up to 20,000 rounds of first calls into a one-bucket map, so
+  every insert meets another, and 100,000 takes and releases each of the face-gen lock. One binary
+  installs the row before the first fork; the other runs the original. In 10 runs of each on this
+  machine (2026-11-10, commit b45bc457): with the row, 0 rounds lost a heap and the depth ended at 0
+  every time. Without it, 72 to 248 of the 20,000 rounds lost a heap, and the depth ended between
+  -3,161 and 4,513 after 400,000 takes and releases. A stepped-threads test (the reviewer's) ends a
+  time slice at the map look-up; it finishes, where the first version hung. Single-thread tests
+  install the row and drive all nine addresses: 200 engines in a row each find their own heap, a
+  heap looked up during the teardown is not kept, and the debug-text section is taken first and left
+  as often as taken.
+
+### Cell entry waits for its own cell
+
+Crossing a cell border outdoors made main wait 45 to 82 ms in one frame, where frames take 12, and 68
+to 150 ms with YUP and SR556 loaded: the largest regular pause in play. Measured with a log of the wait
+and of the loading thread's tasks (measure/smooth-200/BORDERS.md, runs fd-dg1, fd-dg2 and ce-dg-*,
+2026-11-10).
+
+- **The wait.** When the player's cell changes and the new cell still has references queued for
+  loading (`00447950`), `PlayerCharacter::Update` (`0094391c`..`00943964`) gives every queued
+  reference its priority again (`00446b50`: 0 for the entered cell's 3D-critical ones, else
+  `TES::GetCellPriority`, 1 near and 3 far) and waits in the IO manager until the priority-0 work is
+  loaded and post-processed (`00c3dfa0`).
+- **The cells ahead.** At the same crossing `TES::UpdateCurrentGridCell` queues the row of cells
+  three cells ahead of the cell just left (`004528ba`, `00452920`, `0045294a`): a pre-load into the
+  cell buffer, so that the grid's next shift finds them loaded. The exterior cell loader makes each
+  of these tasks at priority 0 (`00527c00`), and the walk above knows only the model loader's
+  references. So the wait takes the row too. The one loading thread runs its cells one after
+  another (5.5 to 7.5 ms each in the base game, 14 to 25 ms with YUP, which has no cell offset
+  table), and in the priority-0 order the entered cell's own loads come after them: in the
+  measured crossing 29 small file loads, 1.5 ms in all.
+- **Nothing needs the row there.** The entered cell is loaded and in the grid already. The cells
+  ahead are outside the grid until it shifts, half a cell further on; at the shift the game cancels
+  the cell loads still queued (`005281f0`) and loads what is missing itself. And when the entered
+  cell has no queued references there is no wait at all, so the code after the wait never had a
+  promise about them.
+- **The row.** Registered over the walk (`crates/host/src/cell_entry_wait.rs`). After the
+  translation's walk, at a cell entry, it walks the exterior cell loader's tasks (`011c9618`, as
+  `00528110` walks them) and requeues each whose priority differs from its cell's, through the
+  task's own requeue (`00440660`, `IOManager::RequeueTask`), as the walk does for references. A
+  queued cell task has no cell object yet (the task makes or finds it when it runs), so the
+  priority is `TES::GetCellPriority`'s arithmetic on the task's coordinates, 1 or 3 (a test holds
+  the two together over the grid); the function's cache of the last cell asked is left alone. A
+  task at the entered cell's own coordinates stays at 0. The requeue refuses a running or finished
+  task (`00c3e690`), so a cell load already running when the player crosses is waited for, one at
+  most. The walk's other caller (`0094cfd6`) passes no cell and waits for nothing: there the cell
+  tasks stay as they are.
+- **What stays the original's.** The wait itself: it post-processes whatever has finished, of any
+  priority, and sleeps a turn while fewer tasks have finished than are in flight (50 ms in the
+  original; the IO wait row ends a turn as soon as that is no longer so). The row's cells load at
+  the priority of their own references, so each cell's task is still post-processed before its
+  references' tasks, and the loads, their results and what is in the cell buffer afterwards are
+  the same; the order of loading differs.
+- **Measured** (2026-11-10, one run each; the smoothness route with the game's threads side by side
+  and the render thread, the PR's exe with a log of the wait added; a check run, not a quiet timing
+  sitting):
+
+  | | Base game, row off | Row on | YUP and SR556, row off | Row on |
+  | --- | --- | --- | --- | --- |
+  | The cell-entry wait | 82.3 ms | 20.3 ms | 67.9 ms | 3.8 ms |
+  | The frame it falls in | 121.7 ms | 55.3 ms | 102.4 ms | 31.1 ms |
+  | The crossing's longest frame (3 before to 40 after) | 121.7 ms | 69.9 ms (the next) | 102.4 ms | 64.7 ms (two after) |
+  | Cells ahead loaded inside the wait | all five | the one already running | all five | none |
+
+  With the row on, the wait is the entered cell's finished loads post-processed (3.7 ms with YUP,
+  7.7 ms in the base game) and, in the base game, the one cell ahead that was already running when
+  the player crossed (12 ms). The other cells ahead ran at priority 3, starting up to 72 ms after the
+  wait began. All of them loaded before the next row was queued. Row off and on loaded the same
+  cells (40 in each base run; with YUP the 40 the shorter run reached), in the same order apart from
+  the row's own. The frames next to the wait keep the border's other work (the grid's shift,
+  terrain points, the renderer's lock, post-processing), so the crossing still has one long frame,
+  about half as long as before. In the vanilla preset a recorded run is byte-identical to main's. In
+  repeatable runs (stepped threads) the loading thread keeps up and the entered cell never has
+  queued loads at the crossing: there is no wait, and the row changes nothing (the same state every
+  frame, the same loading tasks in the same order).
+
 ### Dialogue topic index
 
 `TESTopic::GetOwnerTopic` (`0061a310`) walks the data handler's topic list and asks each topic (`00619e10`, first to
@@ -295,12 +417,41 @@ switched, default typed families, so "off" is the typed walk):
 
 ### The script extender
 
-The built-in xNVSE (ADR-0016) is the same in both presets, except for these rows. Like xNVSE, it
+The built-in xNVSE (ADR-0016) is the same in both presets, except for these rows and the
+differences listed first below. Like xNVSE, it
 writes a `.nvse` co-save beside every save, an empty one too, in both presets: a save without
 one loads as a new game for the extender without resetting what the game before held
 (`Serialization.cpp`, `HandleLoadGame`), which only a save made without the extender (a vanilla
 save) should get.
 
+- **Which xNVSE it is, and its plugins.** The built-in matches xNVSE 6.4.9: `GetNVSEVersion`
+  answers 6, `GetNVSERevision` 4 and `GetNVSEBeta` 9 (xNVSE's `nvse_version.h`:
+  `NVSE_VERSION_INTEGER`, `NVSE_VERSION_INTEGER_MINOR`, `NVSE_VERSION_INTEGER_BETA`), and the
+  co-save header says 6.4. All of them read one constant, `nvse::VERSION`
+  (`crates/nvse/src/lib.rs`): change it there when the built-in catches up with a newer release.
+  `IsPluginInstalled` and `GetPluginVersion` answer by what nv-rs builds in, since no plugin DLL
+  ever loads in nv-rs: no plugin is built in yet, so every name answers not installed (0, and
+  -1 for the version: xNVSE's answers for a plugin it did not load), JIP LN NVSE's names
+  included. That changes when JIP LN NVSE's commands are built in (ADR-0016's I-13): JIP puts
+  its own versions of these two into xNVSE's records when it loads, and they answer for its
+  names.
+- **Where the port differs from xNVSE in both presets** (none is a row). `FireChallenge` with a challenge type
+  outside 0 to 13: the game's function returns nothing and, for such a type, leaves its stack
+  cookie in the upper bytes of the register xNVSE reads its answer from (`005F5970`), so xNVSE
+  answers a number that changes from run to run and is not 0 in practically every run; the port
+  answers the translated function's 0. A mod's `if FireChallenge <bad type> ...` is therefore true
+  in the real game and false here. (For a type of 0 to 13 both answer 1.) `AddAnimation` and
+  `DelAnimation` with a name of 256 bytes or more, and `GetNumericGameSetting`,
+  `SetNumericGameSetting`, `GetNumericIniSetting`, `SetNumericIniSetting` and `GetModIndex` with
+  one of 512 bytes or more, in the vanilla preset: see "Script list and scan guard" below.
+  `AddSpellNS` silences the game's `QueueUIMessage` while AddSpell runs as xNVSE does (a `ret`
+  written at its entry, here a wrap), and the silenced call answers 0, the function's own answer,
+  where xNVSE's `ret` leaves the caller's register as it was; no translated caller reads it.
+  A format string of 16 KB or more (`MessageEx`, `sv_Construct` and every command taking one,
+  the text given or a `$` variable's): xNVSE copies it into its 16 KB buffers without a bound
+  (`s_tempStrArgBuffer`, then `ExtractFormattedString`'s `fmtBuffer` on its stack) and writes
+  past them; the port takes it whole, and cuts the formatted text at 16 KB less 3 bytes only
+  where the C runtime formats it (a format with specifiers).
 - **Co-save keeps other plugins** (the row above): the maintainer's decision, 2026-11-08. The
   sections are kept byte for byte from the co-save of the game loaded (none after a new game or a
   save without a co-save) and written after xNVSE's own section, with that co-save's file list:
@@ -322,7 +473,13 @@ save) should get.
   decision, 2026-11-10) widened the row to a reference handed to a script with parts missing: an
   inventory reference with no base form or cell (`Commands_MiscRef.cpp`'s door teleport and
   parent cell commands), and a door with no teleport data, linked door or lock data
-  (`GetLinkedDoor`, `SetDoorTeleport`, `SetOpenKey`). Under the row only what would otherwise stop
+  (`GetLinkedDoor`, `SetDoorTeleport`, `SetOpenKey`). The coordinator's decision, 2026-11-10
+  (the MiscRef batch's cell scans and owners): the ownership tests' missing cell and base form, a
+  cell reference without a base form in the scans, and `GetNextRef` on a scan record that has ended
+  in the console or was never built (read from `Commands_MiscRef.cpp`'s `CellScan` and the shipped
+  DLL, where a new record's iterator alone is zeroed; not run in the real game) went under this row
+  rather than a new one: few switches, and no player would want one of these on and its neighbour
+  off. The same decision (the Misc batch, 2026-11-10): the door without a sound, the leveled entry without a form and `GenericCheckForm`'s empty node (read in xNVSE's source and the shipped DLL, `10035F30`, `10034835`, `100354C6`; not run in the real game). And `IsRefInList`'s reference without a base form (the List batch, `10031B20`). Under the row only what would otherwise stop
   the game changes; where xNVSE answers, the port answers the same in both presets. Vanilla is
   1:1 with xNVSE, its stops included.
 - **Script array and string size caps, missing array guard, array cycle guard** (the rows
@@ -338,7 +495,18 @@ save) should get.
   game (xNVSE 6.4.9 with JIP LN 57.30: `sv_Construct "refused [%Ld]" 5` ends it with
   0xC0000409, the next line never runs); the memory limit was measured in a 32-bit harness and
   moves a little from run to run.
-- **Script inventory list guard** (the row above): from the review of #365, 2026-11-09. The game's
+- **Script list and scan guard** (the row above, once "Script inventory list guard"): the cell
+  scans' part (the coordinator's decision, 2026-11-10): xNVSE keeps a scan's position as two signed
+  bytes and its depth as an unsigned byte (read in the shipped DLL, xNVSE 6.4.9's `nvse_1_4.dll`:
+  the scan record's constructor and `NextCell`, whose end test compares the byte widened to 32 bits,
+  less the cell's own x or y, with the depth); past 127 the byte wraps and the test is never met.
+  The hang was read, not run in the real game. With the row the walk ends when it is back at its
+  starting position (it has been through every position it can reach, each once, at most 65,536),
+  so `GetNumRefs` and `GetRefs` count and list the references of the cells passed, and
+  `GetFirstRef`/`GetNextRef`, which walk only until they find a reference, go on answering the
+  same references round and round as xNVSE does (in both presets): only a call that goes the whole
+  way round from where it began without finding one is the hang, and with the row it answers 0 (from
+  the review of #409). A depth that ends is walked as xNVSE walks it in both presets. The name buffers' part (the coordinator's decision, 2026-11-10, the Misc batch): read in xNVSE's source and the shipped DLL (`GetAgeClass`'s buffer at `ebp-0x100` with the saved frame above it; `AddAnimation`'s at `ebp-0x104` and `DelAnimation`'s at `ebp-0x110`, the form argument and the command's counters above them); not run in the real game. `GetAgeClass`'s stop is exact (xNVSE faults there). For `AddAnimation` and `DelAnimation` the vanilla stop at 256 bytes is a deviation the coordinator chose (the review of #415): `AddAnimation` at 256 bytes does not stop in xNVSE but adds the name followed by run-dependent bytes (the form pointer's and the frame pointer's), its first real fault at 257 bytes without a form argument and 260 with one; `DelAnimation` from 256 to 264 bytes compares the first 256 bytes and then the node's index byte, so it can delete only the list's first name, its first fault at 265 or 272 bytes. `AddAnimation`'s answer depends on the run and cannot be reproduced; `DelAnimation`'s is fixed by the list and could be, but its stop is kept with `AddAnimation`'s as one rule, since no script means to give such a name. The Game batch's 512-byte names (2026-11-10, the same rule; read in the shipped DLL, not run in the real game): `IsModLoaded`'s buffer (`ebp-0x200`) has the saved frame right above it, so its stop is exact. `GetNumericGameSetting` and `GetNumericIniSetting` (`ebp-0x208`) have the 8-byte number above it, written only after the name is used, so xNVSE reads names of up to 519 bytes whole and faults from 520; `SetNumericGameSetting` and `SetNumericIniSetting` (`ebp-0x204`, the float read after the name above it) and `GetModIndex` (`ebp-0x204`, the name's own pointer stored above it after the read) look up a different name from 512 to 515 bytes and fault from 516. The form lists' part (the coordinator's decision, the reviews of #415 and #420): the same bound as the inventory walks (1,048,576 nodes, `invref::MAX_LIST_NODES`); a walk the row ends answers what it found so far (a count, no index, no node removed, the calls made). The inventory lists' part: from the review of #365, 2026-11-09. The game's
   own lists never run back into themselves; the bound only turns a hang into a stop, or with the row
   into the end of the walk; `GetPaired` (`Commands_Inventory.cpp`) asks again with an index its
   search did not count on, so it ends at the first such answer (the review of #384). The hotkey

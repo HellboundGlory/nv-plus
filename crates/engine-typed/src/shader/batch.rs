@@ -42,13 +42,13 @@ const NULL_BOUND: u32 = 0x011f_4288;
 /// `BSSkinInstance`'s type (`011f49d8`), what the skin's slot 8 answers for a dismember skin.
 pub(crate) const SKIN_RTTI: u32 = 0x011f_49d8;
 
-/// Callees by address: the map's `GetAt` (`thiscall(map, key, out)`) and `SetAt`, the node pool's
-/// allocation (`thiscall(list + 0x10)`), the active list's clear, the memory manager and `operator
-/// new`, the batch renderer's constructor, the shadow-pass test, the shaders' own pass set-ups, the
-/// renderer's skinned test, the geometry holder's draw, the shaders' pass tails, the node pool lock.
+/// Callees by address: the map's `GetAt` (`thiscall(map, key, out)`) and `SetAt`, the active list's
+/// clear, the memory manager and `operator new`, the batch renderer's constructor, the shadow-pass
+/// test, the shadow light shader's per-geometry set-ups (the draw family's, compared by address), the
+/// renderer's skinned test, the geometry holder's draw, a shader's pass tail of kind 0x11, the node
+/// pool lock. The node pool's allocation is draw_f's (`0043a010`).
 const MAP_GET_AT: u32 = 0x0085_3130;
 const MAP_SET_AT: u32 = 0x0084_4700;
-const LIST_NODE_ALLOCATE: u32 = 0x0043_a010;
 const ACTIVE_LIST_CLEAR: u32 = 0x00b6_4ec0;
 const MEMORY_MANAGER: u32 = 0x011f_6238;
 const MEMORY_ALLOCATE: u32 = 0x00aa_3e40;
@@ -61,10 +61,6 @@ const SETUP_TYPES_FC_FD: u32 = 0x00b7_dde0;
 const SETUP_TYPE_CA: u32 = 0x00b7_ded0;
 const SETUP_TYPE_D1: u32 = 0x00b7_dfe0;
 const SETUP_TYPE_102: u32 = 0x00b7_e150;
-const BEGIN_TYPES_FC_102: u32 = 0x00b7_dd50;
-const BEGIN_TYPES_CA_D1: u32 = 0x00b7_deb0;
-const HOLDER_DRAW: u32 = 0x00e6_d310;
-const TAIL_KINDS_1_TO_5: u32 = 0x00b7_ac20;
 const TAIL_KIND_11: u32 = 0x00bb_96d0;
 const LOCK_ENTER: u32 = 0x0040_fbf0;
 /// The global node pool: its lock (owner `011c5f80`, count `011c5f84`) and free list (`011c5f58`).
@@ -76,13 +72,15 @@ const PASS_TYPE_COMPARE: u32 = 0x00b9_88a0;
 /// The alpha sort's comparison (this file's [`compare_by_depth`]).
 const COMPARE_BY_DEPTH: u32 = 0x00b9_8b20;
 
-/// The shader slots the drawing calls: begin a pass (0xf0, 0xfc, 0xf8, 0x100, 0xf4), end it (0x104,
-/// 0x114), per geometry (0x78, 0x7c, 0x80, 0x84, 0x88, 0x6c, 0x8c, 0x110, 0x64).
+/// The shader slots the drawing calls: begin a pass (0xf0 the pass choice, 0xfc its constants, 0xf8
+/// the pair textures, 0x100 its render states, 0xf4 the begin's end), end it (0x104 the render states
+/// put back, 0x114 the end's states put back), per geometry (0x78, 0x7c, 0x80 blending, 0x84 the alpha
+/// function, 0x88 the alpha test, 0x6c, 0x8c, 0x110 the end's states, 0x64).
 mod slot {
     pub const BEGIN: u32 = 0xf0;
-    pub const BEGIN_STATES: u32 = 0xfc;
-    pub const BEGIN_CONSTANTS: u32 = 0xf8;
-    pub const BEGIN_TEXTURES: u32 = 0x100;
+    pub const BEGIN_CONSTANTS: u32 = 0xfc;
+    pub const BEGIN_TEXTURES: u32 = 0xf8;
+    pub const BEGIN_STATES: u32 = 0x100;
     pub const BEGIN_DONE: u32 = 0xf4;
     pub const END: u32 = 0x104;
     pub const END_RESTORE: u32 = 0x114;
@@ -95,11 +93,12 @@ mod slot {
     pub const GEOMETRY_DONE: u32 = 0x8c;
     pub const RESTORE: u32 = 0x110;
     pub const PARTITION: u32 = 0x64;
-    /// The geometry's own: render (0xdc), draws itself (0x30, 0x34), set the holder (0xe0).
+    /// The geometry's own: render (0xdc), draws itself (0x30, 0x34), its immediate draw with the
+    /// renderer (0xe0, `OnlyRenderImmediate`).
     pub const OWN_RENDER: u32 = 0xdc;
     pub const OWN_A: u32 = 0x30;
     pub const OWN_B: u32 = 0x34;
-    pub const SET_HOLDER: u32 = 0xe0;
+    pub const RENDER_IMMEDIATE: u32 = 0xe0;
     /// A batch renderer's `AddPass` ([`super::add_to_group`]) and a map's hash.
     pub const ADD_PASS: u32 = 0x8c;
     pub const MAP_HASH: u32 = 4;
@@ -476,7 +475,11 @@ pub fn render_pass(
             #[allow(clippy::cast_possible_wrap)]
             let kind = e.global::<u32>(shader.wrapping_add(0x68)) as i32;
             if (1..=5).contains(&kind) {
-                e.call(TAIL_KINDS_1_TO_5, &args![shader, pass_type]);
+                typed_call!(
+                    crate::draw::FAMILY,
+                    0x00b7_ac20,
+                    crate::draw::setups::tail_kinds_1_to_5(e, Ptr::new(shader), pass_type)
+                );
             } else if kind == 0x11 {
                 e.call(TAIL_KIND_11, &args![shader, pass_type]);
             }
@@ -517,8 +520,9 @@ fn add_to_geometry_group(
 /// `cdecl(pass, first, second, third)`: draws a plain geometry: into the geometry group, then the
 /// shader's per-geometry set-up (four types have their own set-up functions; the others the slots
 /// 0x78 and 0x7c, the first and second slots unless the pass is a shadow pass, and the owed restore),
-/// the draw (slot 0x6c), the holder to the geometry, and the shader's geometry end (slot 0x8c). The
-/// flags are the low bytes of their words.
+/// the draw (slot 0x6c), the geometry's immediate draw with the renderer (slot 0xe0, the draw
+/// family's or the dispatch family's directly when the slot holds theirs), and the shader's geometry
+/// end (slot 0x8c). The flags are the low bytes of their words.
 pub fn render_standard(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second: u32, third: u32) {
     let (first, second, third) = (low8(first) != 0, low8(second) != 0, low8(third) != 0);
     let pass_type = u32::from(e.get(pass, RenderPass::usPassEnum));
@@ -533,15 +537,15 @@ pub fn render_standard(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second
     let call_third = |e: &mut Engine| {
         if third {
             let flag = u32::from(e.get(pass, RenderPass::ucSortFlag));
-            e.vcall(shader, slot::THIRD, &args![state, flag]);
+            shader_alpha_test(e, shader, state, flag);
         }
     };
     let first_then_second = |e: &mut Engine| {
         if first {
-            e.vcall(shader, slot::FIRST, &args![state]);
+            shader_alpha_function(e, shader, state);
         }
         if second {
-            e.vcall(shader, slot::SECOND, &args![state]);
+            shader_blend(e, shader, state);
         }
     };
     let own = match pass_type {
@@ -558,8 +562,24 @@ pub fn render_standard(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second
                 0x00b7_dde0,
                 crate::render::pass::geometry_pass(e, Ptr::new(shader), Ptr::new(state))
             );
+        } else if setup == SETUP_TYPE_CA {
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_ded0,
+                crate::draw::setups::setup_type_ca(e, Ptr::new(shader), Ptr::new(state))
+            );
+        } else if setup == SETUP_TYPE_D1 {
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_dfe0,
+                crate::draw::setups::setup_type_d1(e, Ptr::new(shader), Ptr::new(state))
+            );
         } else {
-            e.call(setup, &args![shader, state]);
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_e150,
+                crate::draw::setups::setup_type_102(e, Ptr::new(shader), Ptr::new(state))
+            );
         }
         first_then_second(e);
         if then_third {
@@ -569,25 +589,25 @@ pub fn render_standard(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second
         shader_geometry_setups(e, shader, state);
         if e.get(pass, RenderPass::ucSortFlag) != 0 {
             if second && e.call(IS_SHADOW_PASS, &args![pass_type]).u8() == 0 {
-                e.vcall(shader, slot::SECOND, &args![state]);
+                shader_blend(e, shader, state);
             }
             if first
                 && !(4..=5).contains(&pass_type)
                 && !(0xe..=0xf).contains(&pass_type)
                 && pass_type != 0x23a
             {
-                e.vcall(shader, slot::FIRST, &args![state]);
+                shader_alpha_function(e, shader, state);
             }
         } else if e.global::<u8>(RESTORE_OWED) != 0
             && e.call(IS_SHADOW_PASS, &args![pass_type]).u8() == 0
         {
-            e.vcall(shader, slot::RESTORE, &args![state]);
+            shader_restore(e, shader, state);
             e.set_global(RESTORE_OWED, 0u8);
         }
         call_third(e);
     }
     shader_draw(e, shader, geometry, 0u32, buffer, state);
-    e.vcall(geometry.addr(), slot::SET_HOLDER, &args![holder]);
+    render_immediate(e, geometry.addr(), holder);
     shader_geometry_done(e, shader, state);
 }
 
@@ -595,9 +615,9 @@ pub fn render_standard(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second
 /// `cdecl(pass, first, second, third)`: draws a skinned geometry partition by partition (only the
 /// partitions a dismember skin marks drawn): each starts with the shader's partition set-up (slot 0x64,
 /// with the world bound), the first one also with the per-geometry set-up; each is drawn (slot 0x6c)
-/// and handed to the holder (`00e6d310`), and a run of drawn partitions that don't start a run is
-/// drawn with it. A draw that answers 0 inside a run ends the whole call. The model data's dirty flags
-/// clear after, and the shader's geometry end runs.
+/// and handed to the renderer's partition draw (`00e6d310`, the draw family's), and a run of drawn
+/// partitions that don't start a run is drawn with it. A draw that answers 0 inside a run ends the
+/// whole call. The model data's dirty flags clear after, and the shader's geometry end runs.
 pub fn render_skinned(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second: u32, third: u32) {
     let (first, second, third) = (low8(first) != 0, low8(second) != 0, low8(third) != 0);
     let pass_type = u32::from(e.get(pass, RenderPass::usPassEnum));
@@ -623,18 +643,18 @@ pub fn render_skinned(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second:
             let mut partition = partitions.wrapping_add(index.wrapping_mul(0x2c));
             let word = e.global::<u32>(partition.wrapping_add(0x28));
             let bound = typed_call!(leaf::FAMILY, 0x0043_d450, leaf::world_bound(e, geometry));
-            e.vcall(
+            partition_setup(
+                e,
                 shader,
-                slot::PARTITION,
-                &args![
-                    geometry,
-                    skin,
+                [
+                    geometry.addr(),
+                    skin.addr(),
                     partition,
                     word,
                     state,
-                    0u32,
+                    0,
                     geometry.addr().wrapping_add(NiGeometry::m_kWorld.off),
-                    bound
+                    bound,
                 ],
             );
             if first_partition {
@@ -643,23 +663,23 @@ pub fn render_skinned(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second:
                     && e.call(IS_SHADOW_PASS, &args![pass_type]).u8() == 0
                 {
                     if second {
-                        e.vcall(shader, slot::SECOND, &args![state]);
+                        shader_blend(e, shader, state);
                     }
                     if first && !(4..=5).contains(&pass_type) && !(0xe..=0xf).contains(&pass_type) {
-                        e.vcall(shader, slot::FIRST, &args![state]);
+                        shader_alpha_function(e, shader, state);
                     }
                 } else if e.global::<u8>(RESTORE_OWED) != 0 {
-                    e.vcall(shader, slot::RESTORE, &args![state]);
+                    shader_restore(e, shader, state);
                     e.set_global(RESTORE_OWED, 0u8);
                 }
                 if third {
                     let flag = u32::from(e.get(pass, RenderPass::ucSortFlag));
-                    e.vcall(shader, slot::THIRD, &args![state, flag]);
+                    shader_alpha_test(e, shader, state, flag);
                 }
                 first_partition = false;
             }
             let drawn = shader_draw(e, shader, geometry, partition, word, state);
-            e.call(HOLDER_DRAW, &args![holder, drawn, partition, data]);
+            partition_drawn(e, holder, drawn, partition, data.addr());
             if flags != 0 {
                 let mut next = index + 1;
                 while next < count {
@@ -675,7 +695,7 @@ pub fn render_skinned(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second:
                         if drawn == 0 {
                             return;
                         }
-                        e.call(HOLDER_DRAW, &args![holder, drawn, partition, data]);
+                        partition_drawn(e, holder, drawn, partition, data.addr());
                     }
                 }
             }
@@ -696,28 +716,80 @@ pub fn render_skinned(e: &mut Engine, pass: Ptr<RenderPass>, first: u32, second:
 pub fn begin_pass(e: &mut Engine, pass_type: u32, shader: u32) {
     typed_call!(FAMILY, 0x00b9_88e0, end_pass(e));
     e.set_global(PASS_MARKER, 0xffffu16);
-    e.vcall(shader, slot::BEGIN, &args![pass_type]);
+    if crate::slot_target(e, shader, slot::BEGIN) == 0x00b7_af80 {
+        typed_call!(
+            crate::draw::FAMILY,
+            0x00b7_af80,
+            crate::draw::setups::select_pass(e, Ptr::new(shader), pass_type)
+        );
+    } else {
+        e.vcall(shader, slot::BEGIN, &args![pass_type]);
+    }
     for i in 0..16 {
         e.set_global(STAGE_TEXTURES + i * 4, 0u32);
     }
     match pass_type {
         0xca | 0xd1 => {
-            e.call(BEGIN_TYPES_CA_D1, &args![shader]);
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_deb0,
+                crate::draw::setups::begin_types_ca(e, Ptr::new(shader))
+            );
         }
         0xfc | 0xfd => {
-            e.call(BEGIN_TYPES_FC_102, &args![shader]);
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_dd50,
+                crate::draw::setups::begin_types_fc(e, Ptr::new(shader))
+            );
             typed_call!(FAMILY, 0x00b9_7de0, state::set_z_enable(e, 1u8, 0u32));
         }
         0x102 => {
-            e.call(BEGIN_TYPES_FC_102, &args![shader]);
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00b7_dd50,
+                crate::draw::setups::begin_types_fc(e, Ptr::new(shader))
+            );
         }
         _ => {
-            e.vcall(shader, slot::BEGIN_STATES, &args![pass_type]);
-            e.vcall(shader, slot::BEGIN_CONSTANTS, &args![pass_type]);
-            e.vcall(shader, slot::BEGIN_TEXTURES, &args![pass_type]);
+            if crate::slot_target(e, shader, slot::BEGIN_CONSTANTS) == 0x00b7_b450 {
+                typed_call!(
+                    crate::draw::FAMILY,
+                    0x00b7_b450,
+                    crate::draw::setups::setup_pass_constants(e, Ptr::new(shader), pass_type)
+                );
+            } else {
+                e.vcall(shader, slot::BEGIN_CONSTANTS, &args![pass_type]);
+            }
+            if crate::slot_target(e, shader, slot::BEGIN_TEXTURES) == 0x00b7_cfb0 {
+                typed_call!(
+                    FAMILY,
+                    0x00b7_cfb0,
+                    accumulator::set_pair_textures(e, shader, pass_type)
+                );
+            } else {
+                e.vcall(shader, slot::BEGIN_TEXTURES, &args![pass_type]);
+            }
+            if crate::slot_target(e, shader, slot::BEGIN_STATES) == 0x00be_0eb0 {
+                typed_call!(
+                    crate::draw::FAMILY,
+                    0x00be_0eb0,
+                    crate::draw::passes::set_pass_states(e, shader, pass_type)
+                );
+            } else {
+                e.vcall(shader, slot::BEGIN_STATES, &args![pass_type]);
+            }
         }
     }
-    e.vcall(shader, slot::BEGIN_DONE, &args![pass_type]);
+    if crate::slot_target(e, shader, slot::BEGIN_DONE) == 0x00be_1f90 {
+        typed_call!(
+            crate::draw::FAMILY,
+            0x00be_1f90,
+            crate::draw::passes::begin_done(e, shader, pass_type)
+        );
+    } else {
+        e.vcall(shader, slot::BEGIN_DONE, &args![pass_type]);
+    }
     e.set_global(CURRENT_PASS_TYPE, pass_type);
     e.set_global(CURRENT_SHADER, shader);
     e.set_global(RESTORE_OWED, 1u8);
@@ -732,10 +804,26 @@ pub fn end_pass(e: &mut Engine) {
     let shader = e.global::<u32>(CURRENT_SHADER);
     if shader != 0 {
         let pass_type = e.global::<u32>(CURRENT_PASS_TYPE);
-        e.vcall(shader, slot::END, &args![pass_type]);
+        if crate::slot_target(e, shader, slot::END) == 0x00be_0ee0 {
+            typed_call!(
+                crate::draw::FAMILY,
+                0x00be_0ee0,
+                crate::draw::passes::restore_pass_states(e, shader, pass_type)
+            );
+        } else {
+            e.vcall(shader, slot::END, &args![pass_type]);
+        }
         if e.global::<u8>(RESTORE_OWED) == 0 {
             let shader = e.global::<u32>(CURRENT_SHADER);
-            e.vcall(shader, slot::END_RESTORE, &[]);
+            if crate::slot_target(e, shader, slot::END_RESTORE) == 0x00be_0e90 {
+                typed_call!(
+                    crate::draw::FAMILY,
+                    0x00be_0e90,
+                    crate::draw::passes::end_states_restored(e, shader)
+                );
+            } else {
+                e.vcall(shader, slot::END_RESTORE, &[]);
+            }
         }
         let sampler = match e.global::<u32>(CURRENT_PASS_TYPE) {
             0xfe | 0x10b => Some(7u32),
@@ -871,6 +959,67 @@ fn shader_geometry_done(e: &mut Engine, shader: u32, state: u32) {
     }
 }
 
+/// The shader's blending of the geometry (slot 0x80, `thiscall(shader, state)`): `00be1ff0` (this
+/// family's) directly when the slot holds it, as the shadow light shader's classes have; another target
+/// through the vtable.
+#[inline(always)]
+fn shader_blend(e: &mut Engine, shader: u32, state: u32) {
+    if crate::slot_target(e, shader, slot::SECOND) == 0x00be_1ff0 {
+        typed_call!(
+            FAMILY,
+            0x00be_1ff0,
+            accumulator::set_blend_of(e, shader, state)
+        );
+    } else {
+        e.vcall(shader, slot::SECOND, &args![state]);
+    }
+}
+
+/// The shader's alpha function of the geometry (slot 0x84, `thiscall(shader, state)`): `00be20b0` (the
+/// draw family's) directly when the slot holds it; another target through the vtable.
+#[inline(always)]
+fn shader_alpha_function(e: &mut Engine, shader: u32, state: u32) {
+    if crate::slot_target(e, shader, slot::FIRST) == 0x00be_20b0 {
+        typed_call!(
+            crate::draw::FAMILY,
+            0x00be_20b0,
+            crate::draw::passes::alpha_function_of(e, shader, state)
+        );
+    } else {
+        e.vcall(shader, slot::FIRST, &args![state]);
+    }
+}
+
+/// The shader's alpha test and cull mode of the geometry (slot 0x88, `thiscall(shader, state, flag)`):
+/// `00be20e0` (the draw family's) directly when the slot holds it; another target through the vtable.
+#[inline(always)]
+fn shader_alpha_test(e: &mut Engine, shader: u32, state: u32, flag: u32) {
+    if crate::slot_target(e, shader, slot::THIRD) == 0x00be_20e0 {
+        typed_call!(
+            crate::draw::FAMILY,
+            0x00be_20e0,
+            crate::draw::passes::alpha_test_of(e, shader, state, low8(flag) != 0)
+        );
+    } else {
+        e.vcall(shader, slot::THIRD, &args![state, flag]);
+    }
+}
+
+/// The shader's per-geometry restore (slot 0x110, `thiscall(shader, state)`): `00be0e50` (the draw
+/// family's) directly when the slot holds it; another target through the vtable.
+#[inline(always)]
+fn shader_restore(e: &mut Engine, shader: u32, state: u32) {
+    if crate::slot_target(e, shader, slot::RESTORE) == 0x00be_0e50 {
+        typed_call!(
+            crate::draw::FAMILY,
+            0x00be_0e50,
+            crate::draw::passes::end_states(e, shader, state)
+        );
+    } else {
+        e.vcall(shader, slot::RESTORE, &args![state]);
+    }
+}
+
 /// The shader's draw (slot 0x6c, `thiscall(shader, geometry, partition, buffer data, state)`):
 /// `00e812f0` (the render family's `prepare_streams`) directly when the slot holds it, as every
 /// `NiD3DShader` class has; another target through the vtable.
@@ -898,6 +1047,81 @@ fn shader_draw(
     } else {
         e.vcall(shader, slot::DRAW, &args![g, p, b, s]).u32()
     }
+}
+
+/// The geometry's immediate draw with the renderer (slot 0xe0, `OnlyRenderImmediate`): the triangle
+/// shape's, the segmented shape's and the particles' (the draw family's) and the triangle strips' (the
+/// dispatch family's) directly when the slot holds them; another class's through the vtable.
+#[inline(always)]
+fn render_immediate(e: &mut Engine, geometry: u32, renderer: u32) {
+    match crate::slot_target(e, geometry, slot::RENDER_IMMEDIATE) {
+        0x00a7_4600 => typed_call!(
+            crate::draw::FAMILY,
+            0x00a7_4600,
+            crate::draw::shapes::tri_shape_render_immediate(
+                e,
+                Ptr::new(geometry),
+                Ptr::new(renderer)
+            )
+        ),
+        0x00a8_7130 => typed_call!(
+            crate::draw::FAMILY,
+            0x00a8_7130,
+            crate::draw::shapes::segmented_render_immediate(
+                e,
+                Ptr::new(geometry),
+                Ptr::new(renderer)
+            )
+        ),
+        0x00a9_b1f0 => typed_call!(
+            crate::draw::FAMILY,
+            0x00a9_b1f0,
+            crate::draw::shapes::particles_render_immediate(
+                e,
+                Ptr::new(geometry),
+                Ptr::new(renderer)
+            )
+        ),
+        0x00a7_1d70 => typed_call!(
+            crate::dispatch::FAMILY,
+            0x00a7_1d70,
+            crate::dispatch::scene::tri_strips_render_immediate(
+                e,
+                Ptr::new(geometry),
+                Ptr::new(renderer)
+            )
+        ),
+        _ => {
+            e.vcall(geometry, slot::RENDER_IMMEDIATE, &args![renderer]);
+        }
+    }
+}
+
+/// The shader's partition set-up (slot 0x64, eight words): the skinned shader classes' bone set-up
+/// (`00b7a2c0`, the draw family's) directly when the slot holds it; another shader's through the vtable.
+#[inline(always)]
+fn partition_setup(e: &mut Engine, shader: u32, words: [u32; 8]) {
+    if crate::slot_target(e, shader, slot::PARTITION) == 0x00b7_a2c0 {
+        let [a, b, c, d, f, g, h, i] = words;
+        let _: u32 = typed_call!(
+            crate::draw::FAMILY,
+            0x00b7_a2c0,
+            crate::draw::skin::bone_setup(e, Ptr::new(shader), a, b, c, d, f, g, h, i)
+        );
+    } else {
+        e.vcall(shader, slot::PARTITION, &words);
+    }
+}
+
+/// A drawn partition to the renderer's partition draw (`00e6d310`, the draw family's, `thiscall(renderer,
+/// the drawn buffer data, the partition, the data)`).
+#[inline(always)]
+fn partition_drawn(e: &mut Engine, renderer: u32, drawn: u32, partition: u32, data: u32) {
+    typed_call!(
+        crate::draw::FAMILY,
+        0x00e6_d310,
+        crate::draw::packed::draw_partition(e, Ptr::new(renderer), drawn, partition, data)
+    );
 }
 
 /// A geometry's word-answering slot with no arguments (0x30, 0x34): the leaf `00acbb70` (0) that
@@ -1003,13 +1227,14 @@ pub fn sort_list(e: &mut Engine, this: Ptr<PassList>, compare: u32) {
 fn take_node(e: &mut Engine, list: Ptr<PassList>) -> Ptr<PassNode> {
     let spare = e.get(list, PassList::pSpare);
     if spare == 0 {
-        Ptr::new(
-            e.call(
-                LIST_NODE_ALLOCATE,
-                &args![list.addr().wrapping_add(PassList::uiCount.off)],
-            )
-            .u32(),
-        )
+        // The node pool's allocation (`0043a010`, `thiscall` on the list's count).
+        let count = Ptr::new(list.addr().wrapping_add(PassList::uiCount.off));
+        let node: Ptr = typed_call!(
+            crate::draw_f::FAMILY,
+            0x0043_a010,
+            crate::draw_f::helpers::allocate_node(e, count)
+        );
+        Ptr::new(node.addr())
     } else {
         let next = e.global::<u32>(spare);
         e.set(list, PassList::pSpare, next);

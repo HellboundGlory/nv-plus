@@ -480,7 +480,8 @@ pub(crate) fn ensure_main(e: &mut Engine) {
 /// The game threads as one line (a diagnostic): each thread's id, start, run state (a sleeper's
 /// wake time from now, in ms), suspend count when not 0, and how many turns it has had.
 pub fn describe(e: &mut Engine) -> String {
-    let now = e.clock_now_us();
+    // A peek: a diagnostic must not move a repeatable run's clock (each reading does).
+    let now = e.clock_peek_us();
     e.kernel
         .threads
         .list
@@ -1389,8 +1390,9 @@ pub fn finish_main_frame(e: &mut Engine, main: &mut MainThread) -> MainTurn {
     } else {
         0
     };
+    let moved = e.moved();
     if let Some(r) = &e.real {
-        stopped = r.frame_ended(&mut e.mem, now);
+        stopped = r.frame_ended(&mut e.mem, moved, now);
         main.host_holds_kernel = true;
     } else if e.mem.is_shared() && e.mem.deferred_pages() >= crate::real_threads::HAND_BACK_AT {
         // Stepped threads with the render helpers (`real_threads::fork_join` shared the memory,
@@ -1398,6 +1400,13 @@ pub fn finish_main_frame(e: &mut Engine, main: &mut MainThread) -> MainTurn {
         // runs anywhere (the stepped threads run only with the engine, the helpers only inside a
         // fork, which main's frame has finished).
         e.mem.hand_back_deferred();
+    }
+    if e.real.is_none() {
+        // Stepped threads: no guest code runs anywhere now (as above), so the moved families'
+        // freed buffers go back to the host at once.
+        if let Some(m) = moved {
+            m.buffers.reclaim();
+        }
     }
     if let Some(r) = e.mem.race_census() {
         r.frame_ended();
@@ -1637,5 +1646,18 @@ mod main_thread_tests {
             panic!("a stop");
         };
         assert!(why.contains("00abcdef"), "{why}");
+    }
+
+    /// A diagnostic must not move a repeatable run's clock (each reading moves it 1 us): `describe`,
+    /// which `NV_MOVE_THREADS` prints at each status line (every 5 s of wall time, so at frames that
+    /// differ between runs), peeks at the clock.
+    #[test]
+    fn describe_leaves_a_repeatable_clock_where_it_was() {
+        let mut e = Engine::new();
+        e.start_repeatable_clock();
+        let before = e.clock_peek_us();
+        let _ = describe(&mut e);
+        let _ = describe(&mut e);
+        assert_eq!(e.clock_peek_us(), before);
     }
 }

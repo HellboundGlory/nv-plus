@@ -90,9 +90,17 @@
 //! - `0x00400000..0x01409000`: the executable's image; its data sections at their own
 //!   addresses (`.rdata` 0x00FDF000, `.data` 0x01183000, ...), mapped from the player's
 //!   installed FalloutNV.exe by [`crate::exe`] or set up by a test;
-//! - `0x01409000..`[`HEAP_BASE`]: free for `VirtualAlloc` reservations at an address the
-//!   caller chooses (`units/platform.rs`; the game's `MemoryPool`s would search 16 MB
-//!   boundaries here, but the port's memory manager does not make them);
+//! - `0x01409000..0x10000000`: `VirtualAlloc` reservations: those the system places (address
+//!   0: the scrap heaps' 8 MiB buffers) first fit from 0x01410000 (`units/platform.rs`,
+//!   `RESERVE_GAP`; a heap block when it is full, or with `NV_RESERVE_GAP=off`), and those at an
+//!   address the caller chooses (the game's `MemoryPool`s would search 16 MB boundaries here,
+//!   but the port's memory manager does not make them). Nothing else of the port is placed here
+//!   (the census counts any page mapped outside a reservation);
+//! - `0x10000000..`[`HEAP_BASE`]: the moved area of the typed migration's stage 2
+//!   ([`crate::typed::moved`]): the slab's handles (`0x10000000..0x14000000`) and the buffers'
+//!   start-only tokens (`0x14000000..0x18000000`), never mapped (a moved object's bytes are host
+//!   memory outside this space), and 16-byte stubs (`0x18000000..0x20000000`, mapped as they are
+//!   handed out). `VirtualAlloc` at a chosen address fails here;
 //! - [`HEAP_BASE`]`..`[`HEAP_LOW_END`]: the heap's lower range, handed out by [`Mem::alloc`]
 //!   (the translation of the game's allocator is `platform`, see `units/platform.rs`; its free
 //!   space and the choice of where a block goes are in `mem/heap.rs`). Every heap block, every
@@ -798,6 +806,47 @@ pub fn freed_word(addr: u32) -> u32 {
 /// The base of the freed-block check's words: the heap's end, so that a heap address shifted
 /// down by 4 (at most 0x0EFFFFFF) lands between it and 0xFF000000.
 const FREED_WORDS: u32 = HEAP_END;
+
+/// What a fault at the unmapped address `a` is, when it is one of stage 2's
+/// (`typed::moved`): a slab handle or a buffer token (a moved object or array reached by untyped
+/// code), a stub page never handed out, the poison area (a moved field followed as a pointer), or
+/// a pointer read from a freed slab block. Empty for any other address.
+#[cold]
+fn moved_note(a: u32) -> String {
+    use crate::typed::moved;
+    if moved::is_handle(a) {
+        return " (stage 2's slab range: if a family is moved, a moved object reached by untyped \
+                code)"
+            .into();
+    }
+    if moved::is_token(a) {
+        return " (stage 2's buffer tokens: if a family is moved, a moved array reached by \
+                untyped code)"
+            .into();
+    }
+    if moved::is_stub(a) {
+        return " (stage 2's stub range: if a family is moved, a stub page never handed out)"
+            .into();
+    }
+    if a >= moved::POISON_BASE {
+        return match moved::poison_parts(a & !3) {
+            Some((family, field)) => format!(
+                " (the last 64 KB, which nothing maps: if a family is moved, stage 2's poison of \
+                 family {family}'s field +{field:x} or near it, followed as a pointer by untyped \
+                 code)"
+            ),
+            None => " (the last 64 KB, which nothing maps)".into(),
+        };
+    }
+    let freed = (a & 0x0fff_ffff) << 4;
+    if a >= FREED_WORDS && moved::is_handle(freed) {
+        return format!(
+            " (if a family is moved: a pointer read from a freed moved object, at or below \
+             {freed:08x})"
+        );
+    }
+    String::new()
+}
 
 /// What the freed-block check knows of the quarantined block `block`: its size asked for, the
 /// functions running when it was allocated and freed with their paths, and (real threads) the
@@ -1516,6 +1565,16 @@ impl Mem {
         if len == 0 {
             return;
         }
+        // Stage 2's slab handles and buffer tokens name host memory, never guest pages
+        // (`typed::moved`): mapped, an untyped access of a moved object would read on unseen.
+        let never = crate::typed::moved::SLAB_RANGE.start..crate::typed::moved::TOKEN_RANGE.end;
+        assert!(
+            u64::from(addr) + u64::from(len) <= u64::from(never.start) || addr >= never.end,
+            "map of {addr:08x}+{len:x}: the moved area's slab handles and buffer tokens \
+             ({:08x}..{:08x}) are never guest memory",
+            never.start,
+            never.end
+        );
         let first = (addr >> PAGE_BITS) as usize;
         let last = ((addr as u64 + len as u64 - 1) >> PAGE_BITS) as usize;
         let end = (last + 1).min(PAGES);
@@ -1990,7 +2049,7 @@ impl Mem {
             let state = self.page_state((a >> PAGE_BITS) as usize);
             if state != MAPPED {
                 if state != TOUCH {
-                    panic!("write to unmapped memory at {a:08x}");
+                    panic!("write to unmapped memory at {a:08x}{}", moved_note(a));
                 }
                 self.touch_note(a, n, true);
             }
@@ -2015,7 +2074,7 @@ impl Mem {
     fn read_fault(&self, a: u32) -> ! {
         match self.freed_block_of(a) {
             Some(block) => panic!("read of unmapped memory at {a:08x} ({block})"),
-            None => panic!("read of unmapped memory at {a:08x}"),
+            None => panic!("read of unmapped memory at {a:08x}{}", moved_note(a)),
         }
     }
 
@@ -2056,7 +2115,7 @@ impl Mem {
 
     pub fn write(&self, addr: u32, data: &[u8]) {
         if let Err(Fault(a)) = self.try_write(addr, data) {
-            panic!("write to unmapped memory at {a:08x}");
+            panic!("write to unmapped memory at {a:08x}{}", moved_note(a));
         }
     }
 
@@ -2186,7 +2245,7 @@ impl Mem {
             return;
         }
         if let Err(Fault(at)) = self.try_write_raw(a, &b) {
-            panic!("write to unmapped memory at {at:08x}");
+            panic!("write to unmapped memory at {at:08x}{}", moved_note(at));
         }
     }
 
@@ -3759,7 +3818,7 @@ mod tests {
     #[test]
     fn kept_pages_stay_under_the_limit() {
         let mut m = Mem::new();
-        const AT: u32 = 0x1000_0000;
+        const AT: u32 = 0x0800_0000;
         let pages = KEEP_MAX as u32 + 2;
         m.map(AT, pages << PAGE_BITS);
         for i in 0..pages {
@@ -3911,7 +3970,7 @@ mod tests {
         // below them, where the hand (still at page 0) comes first: the next unmap of the half
         // hands that run back in one call and keeps its own pages.
         let first = (AT >> PAGE_BITS) as usize;
-        let run = 0x1000_0000;
+        let run = 0x0800_0000;
         m.map(AT, (2 * half) << PAGE_BITS);
         m.map(run, half << PAGE_BITS);
         m.unmap(run, half << PAGE_BITS);
@@ -3934,7 +3993,7 @@ mod tests {
     #[test]
     fn a_hand_back_that_reaches_the_end_of_the_space_goes_on_from_its_start() {
         let mut m = Mem::new();
-        const LOW: u32 = 0x1000_0000;
+        const LOW: u32 = 0x0800_0000;
         let page = |a: u32| (a >> PAGE_BITS) as usize;
         // The last page of the space, then 4095 pages in one run at LOW: 4096 kept.
         m.map(0xffff_f000, 0x1000);

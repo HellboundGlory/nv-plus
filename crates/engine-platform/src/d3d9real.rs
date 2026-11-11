@@ -28,7 +28,9 @@
 //!
 //! The real window lives on a thread of its own that only creates it and pumps its messages, so
 //! it never waits on the game's threads, whatever the backend: each one draws into it (wgpu's
-//! surface is made on it), and its keyboard and mouse feed the game's DirectInput.
+//! surface is made on it), and its keyboard and mouse feed the game's DirectInput. Scripted runs
+//! show it behind the other windows (`NV_D3D9_BACKGROUND`) or not at all (`NV_D3D9_HIDDEN=1`,
+//! `Showing`).
 //!
 //! The real device is created with `D3DCREATE_FPU_PRESERVE` added to the game's flags: the
 //! game's x87 precision switch is modelled (`crate::direct3d_device_created`,
@@ -145,6 +147,9 @@ pub struct Real {
     /// How many queries the game made at each address (the board's `made`: a query made again at
     /// a destroyed one's address is not read as the old one).
     queries_made: engine_core::AddrMap<u32, u64>,
+    /// With the render thread on wgpu: the occlusion counts the backend posts
+    /// (`d3d9_wgpu::QueryAnswers`), read without waiting for the render thread.
+    wgpu_answers: Option<std::sync::Arc<d3d9_wgpu::QueryAnswers>>,
     /// The game's side's notes already printed.
     logged: HashSet<&'static str>,
     /// Whether the stream gets a render thread ([`want_render_thread`]).
@@ -152,6 +157,8 @@ pub struct Real {
     /// Whether the real backend compiles the game's shaders ahead of their first draw
     /// ([`want_shader_warm`]).
     shader_warm: bool,
+    /// Where wgpu keeps the driver's compiled pipelines between runs ([`want_wgpu_cache`]).
+    wgpu_cache: Option<std::path::PathBuf>,
     /// Tests: the real backend behind the stream, to look at ([`real_texture`]).
     #[cfg(test)]
     test_backend: Option<std::sync::Arc<std::sync::Mutex<super::d3d9backend::RealBackend>>>,
@@ -317,6 +324,10 @@ extern "system" fn window_procedure(
             "NV_D3D9={}: the game's window was closed: the run ends",
             tag()
         );
+        // What the host asked to finish first (the copy-out of saves, `crate::on_exit`). The window
+        // runs on its own thread, so this covers only the jobs main has already handed on: a save
+        // written in the frame still running on main when the window closes can be lost.
+        crate::run_exit_hooks();
         std::process::exit(0);
     }
     match message {
@@ -581,13 +592,15 @@ fn window_input(_window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
 }
 
 /// A window to make on the window thread: title, style, extended style, rectangle, the real
-/// parent (0 for a top-level window), and where the handle goes (0 when it failed).
+/// parent (0 for a top-level window), how a top-level `WS_VISIBLE` one is shown, and where the
+/// handle goes (0 when it failed).
 struct Request {
     title: Vec<u8>,
     style: u32,
     ex_style: u32,
     rect: [i32; 4],
     parent: isize,
+    show: Showing,
     reply: std::sync::mpsc::Sender<isize>,
 }
 
@@ -611,6 +624,45 @@ fn window_thread() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Request>
 /// shown as the game's `WS_VISIBLE` window is: activated.
 fn shown_in_background() -> bool {
     std::env::var_os("NV_D3D9_BACKGROUND").is_some()
+}
+
+/// How the window thread shows a top-level window the game made visible (`WS_VISIBLE`). The real
+/// top-level window is made without `WS_VISIBLE` in every case and shown afterwards, or not at
+/// all. What the game reads about its window comes from the modelled one (`super::window`: its
+/// style with `WS_VISIBLE`, its rectangle, the active window), never from the real one, so the
+/// game sees the same window whichever this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Showing {
+    /// Shown and activated, as Windows shows the game's window.
+    Activated,
+    /// Shown without the focus, at the bottom of the window stack ([`shown_in_background`]).
+    Background,
+    /// Never shown (`NV_D3D9_HIDDEN=1`, for the scripted runs whose recordings are compared):
+    /// nothing on any monitor, not even for a moment as it is made, and no taskbar button. The
+    /// game's child window inside it, the borderless window and the device on it are made as for
+    /// a shown one; the device draws and presents into it all the same.
+    Never,
+}
+
+impl Showing {
+    /// The run's choice: `NV_D3D9_HIDDEN=1` before `NV_D3D9_BACKGROUND`.
+    fn asked() -> Showing {
+        Showing::of(
+            std::env::var("NV_D3D9_HIDDEN").ok().as_deref(),
+            shown_in_background(),
+        )
+    }
+
+    /// The choice for `NV_D3D9_HIDDEN`'s value (`None` unset) and `NV_D3D9_BACKGROUND`.
+    fn of(hidden: Option<&str>, background: bool) -> Showing {
+        if hidden == Some("1") {
+            Showing::Never
+        } else if background {
+            Showing::Background
+        } else {
+            Showing::Activated
+        }
+    }
 }
 
 /// Whether the game's window is borderless and covers the primary monitor (`NV_BORDERLESS`, the
@@ -661,8 +713,8 @@ unsafe fn run_window_thread(rx: std::sync::mpsc::Receiver<Request>) {
             title.push(0);
             let [left, top, right, bottom] = request.rect;
             let child = request.parent != 0;
-            // A top-level window is shown afterwards (activated, or in the background for the
-            // scripted runs: [`shown_in_background`]).
+            // A top-level window is shown afterwards (activated, in the background for the
+            // scripted runs, or never: [`Showing`]).
             let borderless = !child && borderless();
             let fills = child
                 && request.parent != 0
@@ -708,26 +760,30 @@ unsafe fn run_window_thread(rx: std::sync::mpsc::Receiver<Request>) {
                         BORDERLESS_WINDOW.store(w.0 as isize, std::sync::atomic::Ordering::Relaxed);
                     }
                     if !child && request.style & WS_VISIBLE.0 != 0 {
-                        let show = if shown_in_background() {
-                            SW_SHOWNOACTIVATE
-                        } else {
-                            SW_SHOW
-                        };
-                        let _ = ShowWindow(w, show);
-                        // In the background a new window still lands on top of the stack, in
-                        // front of whatever the person at the machine is using: put it at the
-                        // bottom instead (it keeps drawing there; the game's own `SetWindowPos`
-                        // calls keep the order, `SWP_NOZORDER` in `window_moved`).
-                        if shown_in_background() {
-                            let _ = SetWindowPos(
-                                w,
-                                HWND_BOTTOM,
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                            );
+                        match request.show {
+                            Showing::Activated => {
+                                let _ = ShowWindow(w, SW_SHOW);
+                            }
+                            Showing::Background => {
+                                let _ = ShowWindow(w, SW_SHOWNOACTIVATE);
+                                // In the background a new window still lands on top of the
+                                // stack, in front of whatever the person at the machine is
+                                // using: put it at the bottom instead (it keeps drawing there;
+                                // the game's own `SetWindowPos` calls keep the order,
+                                // `SWP_NOZORDER` in `window_moved`).
+                                let _ = SetWindowPos(
+                                    w,
+                                    HWND_BOTTOM,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                );
+                            }
+                            // Nothing shows it later either: `window_moved` never passes
+                            // `SWP_SHOWWINDOW`, and the windowed device does not show its window.
+                            Showing::Never => {}
                         }
                     }
                     w.0 as isize
@@ -782,6 +838,7 @@ pub fn window_created(
         ex_style,
         rect,
         parent: real_parent,
+        show: Showing::asked(),
         reply,
     };
     let sent = window_thread()
@@ -860,8 +917,17 @@ pub fn want_render_thread(e: &mut Engine, on: bool) {
 fn backend_of(
     which: Backends,
     board: Option<std::sync::Arc<super::d3d9backend::QueryBoard>>,
+    answers: Option<std::sync::Arc<d3d9_wgpu::QueryAnswers>>,
     warm: bool,
+    wgpu_cache: Option<std::path::PathBuf>,
 ) -> Box<dyn d3d9_stream::Backend> {
+    let wgpu = |output| {
+        let b = d3d9_wgpu::WgpuBackend::new(output);
+        match wgpu_cache.clone() {
+            Some(dir) => b.with_cache_dir(dir),
+            None => b,
+        }
+    };
     let real = || -> Box<dyn d3d9_stream::Backend> {
         Box::new(
             match board.clone() {
@@ -873,11 +939,50 @@ fn backend_of(
     };
     match which {
         Backends::Real => real(),
-        Backends::Wgpu => Box::new(d3d9_wgpu::WgpuBackend::new(d3d9_wgpu::Output::Window)),
+        Backends::Wgpu => Box::new(WgpuWithReport {
+            wgpu: match answers {
+                Some(a) => wgpu(d3d9_wgpu::Output::Window).with_answers(a),
+                None => wgpu(d3d9_wgpu::Output::Window),
+            },
+            back_buffer: 0,
+        }),
         Backends::RealAndWgpu => Box::new(d3d9_stream::Tee::new(
             real(),
-            Box::new(d3d9_wgpu::WgpuBackend::new(d3d9_wgpu::Output::Offscreen)),
+            Box::new(wgpu(d3d9_wgpu::Output::Offscreen)),
         )),
+    }
+}
+
+/// The wgpu backend on the game's window, with the F12 report (`shot::report_with`) at each
+/// `Present`, as the real backend makes it in its own: the back buffer read from wgpu before the
+/// frame is presented.
+struct WgpuWithReport {
+    wgpu: d3d9_wgpu::WgpuBackend,
+    /// The device's first back buffer (`CreateDevice`, `Reset`).
+    back_buffer: u32,
+}
+
+impl d3d9_stream::Backend for WgpuWithReport {
+    fn execute(&mut self, cmd: Cmd<Data<'_>>) -> Reply {
+        match &cmd {
+            Cmd::CreateDevice { back_buffers, .. } | Cmd::Reset { back_buffers, .. } => {
+                self.back_buffer = back_buffers.to_words().first().copied().unwrap_or(0);
+            }
+            Cmd::Present { .. } => {
+                let (wgpu, back) = (&mut self.wgpu, self.back_buffer);
+                shot::report_with(|| {
+                    wgpu.device()
+                        .and_then(|d| d.read_surface_pixels(back))
+                        .ok_or_else(|| "the back buffer could not be read from wgpu".to_string())
+                });
+            }
+            _ => {}
+        }
+        self.wgpu.execute(cmd)
+    }
+
+    fn idle(&mut self) -> bool {
+        self.wgpu.idle()
     }
 }
 
@@ -889,17 +994,39 @@ pub fn want_shader_warm(e: &mut Engine, on: bool) {
     real(e).shader_warm = on;
 }
 
+/// Where the wgpu backend keeps the driver's compiled pipelines between runs (the host's
+/// `wgpu_cache_path`), set before the game starts. None until set: a test or tool keeps nothing.
+pub fn want_wgpu_cache(e: &mut Engine, dir: std::path::PathBuf) {
+    real(e).wgpu_cache = Some(dir);
+    // The run ends with `std::process::exit` (the window closed, the game's quit): the backend's
+    // device is never dropped, so its last pipelines are written by the exit hooks, after the
+    // saves' flush (a late hook): the player's save first, then the files that can be made again.
+    crate::on_exit_late(d3d9_wgpu::save_pipeline_caches);
+}
+
 /// `Direct3DCreate9` made a modelled `IDirect3D9`: the stream to the backend `NV_D3D9` names
 /// (once), on the calling thread or on the render thread ([`want_render_thread`]), written to a
 /// file with `NV_D3D9_RECORD=FILE`.
 pub fn direct3d_created(e: &mut Engine) {
-    let Some(which) = backends() else { return };
+    let Some(mut which) = backends() else { return };
     if real(e).stream.is_some() {
         return;
+    }
+    // wgpu without a graphics card it can draw with (no Vulkan or Direct3D 12 driver, only the
+    // software adapter): the real Direct3D 9 instead, so the player still gets a picture.
+    if which == Backends::Wgpu {
+        match d3d9_wgpu::hardware_adapter() {
+            Some(adapter) => eprintln!("NV_D3D9=wgpu: drawing with {adapter}"),
+            None => {
+                eprintln!("NV_D3D9=wgpu: no graphics card wgpu can draw with (Vulkan or Direct3D 12): the real Direct3D 9 draws instead");
+                which = Backends::Real;
+            }
+        }
     }
     let name = which.name();
     let wanted_thread = real(e).render_thread;
     let warm = real(e).shader_warm;
+    let wgpu_cache = real(e).wgpu_cache.clone();
     // `NV_FACE_CHECK` (a diagnostic) follows calls in the game's order on its own thread: it keeps
     // the calls on the game's threads, as diagnostics keep the threads stepped.
     let refused = wanted_thread && face_check::enabled();
@@ -916,14 +1043,21 @@ pub fn direct3d_created(e: &mut Engine) {
             .real()
             .then(|| std::sync::Arc::new(super::d3d9backend::QueryBoard::default()));
         real(e).query_board = board.clone();
+        // wgpu alone on the window: its occlusion counts, posted by the render thread.
+        let answers = matches!(which, Backends::Wgpu)
+            .then(|| std::sync::Arc::new(d3d9_wgpu::QueryAnswers::default()));
+        real(e).wgpu_answers = answers.clone();
         eprintln!(
             "NV_D3D9={name}: the render thread is on (NV_RENDER_THREAD=0 turns it off; at most {} frame(s) in flight{})",
             settings.frames_in_flight,
             if settings.check { ", the stream checked" } else { "" }
         );
-        Stream::threaded(backend_of(which, board, warm), settings)
+        Stream::threaded(
+            backend_of(which, board, answers, warm, wgpu_cache),
+            settings,
+        )
     } else {
-        Stream::direct(backend_of(which, None, warm))
+        Stream::direct(backend_of(which, None, None, warm, wgpu_cache))
     };
     if let Some(path) = std::env::var_os("NV_D3D9_RECORD") {
         // `NV_REPEATABLE`: the record leaves out what differs between two runs of the same
@@ -2000,7 +2134,7 @@ const S_FALSE: u32 = 1;
 const REPEATABLE_QUERY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn query_issue(e: &mut Engine, query: u32, flags: u32) {
-    if flags == ISSUE_END && is_forwarded(e, query) {
+    if flags & ISSUE_END != 0 && is_forwarded(e, query) {
         *real(e).query_ends.entry(query).or_default() += 1;
     }
     record_on(e, query, Cmd::QueryIssue { query, flags });
@@ -2050,12 +2184,50 @@ pub fn query_get_data(e: &mut Engine, query: u32, flags: u32) -> Option<(u32, u3
             }
         }
     }
+    if let Some(answer) = wgpu_answer(real(e), query) {
+        return answer;
+    }
     if let Some(answer) = query_without_waiting(real(e), query, flags) {
         return answer;
     }
     match call(e, Cmd::QueryGetData { query, flags }) {
         Some(Reply::Query(answer)) => answer,
         _ => None,
+    }
+}
+
+/// [`query_get_data`] with the render thread on wgpu, never waiting for it (`None` without them):
+/// the count the render thread posted for the game's last `END` of this query (it posts each once
+/// the GPU has it, `d3d9_wgpu::QueryAnswers`), else `S_FALSE`, as Direct3D 9 answers until the
+/// GPU is done, with the commands recorded so far handed over so the count comes. With or without
+/// `D3DGETDATA_FLUSH`: the render thread sends the batch holding an awaited `END` and polls for
+/// its count whenever it has nothing else to do, so the count comes with nothing else asked (the
+/// exe's readers ask once a frame and take "not yet" as "ask again later"; none waits in a loop:
+/// the reference volumes' loop, `00b63680`, repeats only while answers are ready, and its one
+/// caller does not ask it to wait). An event query's answer is the model's (`None` inside).
+fn wgpu_answer(r: &mut Real, query: u32) -> Option<Option<(u32, u32)>> {
+    let answers = r.wgpu_answers.as_ref()?;
+    let recorded = r.query_ends.get(&query).copied().unwrap_or(0);
+    let made = r.queries_made.get(&query).copied().unwrap_or(0);
+    let answer = answers.get(query);
+    if answer.is_some_and(|a| a.made == made && !a.occlusion) {
+        return Some(None);
+    }
+    match answer {
+        Some(a) if a.made == made && a.ends == recorded && a.count.is_some() => {
+            if let Some(s) = r.stream.as_mut() {
+                s.note("query results read at once");
+            }
+            Some(a.count.map(|n| (0, n)))
+        }
+        // Not in yet, or the game's last `END` (or the query) not carried out yet.
+        _ => {
+            if let Some(s) = r.stream.as_mut() {
+                s.flush();
+                s.note("query results not in yet");
+            }
+            Some(Some((S_FALSE, 0)))
+        }
     }
 }
 
@@ -2371,6 +2543,12 @@ pub(super) mod shot {
     /// end (`log.txt`, from the file `NV_REPORT_LOG` names) and a `note.txt` for the player's own
     /// words; a beep says it is done. The game's state and the model are not touched.
     pub(crate) fn report_at_present(d: &IDirect3DDevice9) {
+        report_with(|| capture(d));
+    }
+
+    /// [`report_at_present`] for any backend: `picture` gives the frame's pixels (rows top
+    /// first, B, G, R, X), called only when a report was asked for.
+    pub(crate) fn report_with(picture: impl FnOnce() -> Result<(u32, u32, Vec<u8>), String>) {
         if !REPORT_ASKED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -2378,7 +2556,7 @@ pub(super) mod shot {
             eprintln!("F12: the report's folder could not be made");
             return;
         };
-        match capture(d) {
+        match picture() {
             Ok((width, height, pixels)) => {
                 let _ = std::fs::write(folder.join("picture.bmp"), bmp(width, height, &pixels));
             }
@@ -3054,6 +3232,7 @@ pub(crate) fn test_window() -> Option<isize> {
                 ex_style: 0,
                 rect: [0, 0, 64, 64],
                 parent: 0,
+                show: Showing::Never,
                 reply,
             })
             .is_ok()
@@ -3282,6 +3461,108 @@ mod tests {
         assert!(!Backends::Wgpu.real());
     }
 
+    /// `NV_D3D9_HIDDEN=1` keeps the window from being shown whatever `NV_D3D9_BACKGROUND` says;
+    /// any other value of it leaves the window as `NV_D3D9_BACKGROUND` has it.
+    #[test]
+    fn nv_d3d9_hidden_wins_over_the_background() {
+        assert_eq!(Showing::of(None, false), Showing::Activated);
+        assert_eq!(Showing::of(None, true), Showing::Background);
+        assert_eq!(Showing::of(Some("1"), false), Showing::Never);
+        assert_eq!(Showing::of(Some("1"), true), Showing::Never);
+        for other in ["0", "", "yes", " 1"] {
+            assert_eq!(Showing::of(Some(other), false), Showing::Activated);
+            assert_eq!(Showing::of(Some(other), true), Showing::Background);
+        }
+    }
+
+    /// A game window that is never shown ([`Showing::Never`]): the top-level window, asked for
+    /// with `WS_VISIBLE` as the game asks (its styles as its runs print them), and the child window
+    /// in it are made, the child keeping the `WS_VISIBLE` the game gave it, and neither is visible.
+    /// A windowed real device on the child, the top-level window its focus window, clears and
+    /// presents with `D3D_OK` (the model's answers: nothing is printed as differing) and shows no
+    /// window. Skipped where Direct3D 9 has no device (no display adapter, as on CI).
+    #[test]
+    fn a_window_never_shown_stays_hidden_and_its_device_presents() {
+        use d3d9_stream::Backend as _;
+        let _turn = real_turn();
+        let make = |style: u32, rect: [i32; 4], parent: isize| -> Option<isize> {
+            let (reply, answer) = std::sync::mpsc::channel();
+            let sent = window_thread()
+                .lock()
+                .map(|tx| {
+                    tx.send(Request {
+                        title: b"nv-rs hidden test".to_vec(),
+                        style,
+                        ex_style: 0,
+                        rect,
+                        parent,
+                        show: Showing::Never,
+                        reply,
+                    })
+                    .is_ok()
+                })
+                .unwrap_or(false);
+            answer.recv().ok().filter(|&w| sent && w != 0)
+        };
+        let top = make(0x14c0_0000, [0, 0, 320, 240], 0).expect("the top-level window");
+        let child = make(0x5000_0000, [0, 0, 64, 64], top).expect("the child window");
+        let visible = |w: isize| unsafe { IsWindowVisible(HWND(w as *mut _)) }.as_bool();
+        let style = |w: isize| unsafe { GetWindowLongW(HWND(w as *mut _), GWL_STYLE) } as u32;
+        assert!(!visible(top) && !visible(child));
+        assert_eq!(
+            style(top) & WS_VISIBLE.0,
+            0,
+            "the top-level window never shown"
+        );
+        assert_ne!(
+            style(child) & WS_VISIBLE.0,
+            0,
+            "the child as the game made it"
+        );
+        let mut b = crate::d3d9backend::RealBackend::new();
+        let device = 0x1000;
+        let present = test_present();
+        let made = b.execute(Cmd::CreateDevice {
+            device,
+            focus: top,
+            window: child,
+            behavior: 0x54,
+            present: Data::from_words(&present),
+            back_buffers: Data::from_words(&[]),
+            depth_stencil: 0,
+        });
+        if !matches!(made, Reply::Device { created: true, .. }) {
+            eprintln!("no Direct3D 9 device here: the device's half of this test is skipped");
+            return;
+        }
+        for frame in 1..=3 {
+            b.execute(Cmd::Clear {
+                device,
+                count: 0,
+                rects: None,
+                flags: 1,
+                colour: 0xff20_4060,
+                z: 0,
+                stencil: 0,
+                model: 0,
+            });
+            b.execute(Cmd::Present {
+                device,
+                source: None,
+                dest: None,
+                window: 0,
+                dirty: false,
+                model: 0,
+                frame,
+            });
+        }
+        assert!(b.logged.is_empty(), "differing answers: {:?}", b.logged);
+        assert!(
+            !visible(top) && !visible(child),
+            "the device shows no window"
+        );
+    }
+
     /// An F12 report's `log-start.txt`: the log's first bytes, cut back to a whole line.
     #[test]
     fn the_logs_start_ends_at_a_whole_line() {
@@ -3433,6 +3714,55 @@ mod tests {
         assert_eq!(query_get_data(&mut e, 0x30, 0), None);
         forget(&mut e, 0x10);
         assert_eq!(real(&mut e).query_ends.get(&0x10), None);
+    }
+
+    /// With the render thread on wgpu a query read never waits, with or without
+    /// `D3DGETDATA_FLUSH`: "not in yet" until the backend posted the count of the game's last
+    /// `END`, then that count; a later `END` waits for its own; an event query's answer is the
+    /// model's; a query made again at the same address is not read as the old one.
+    #[test]
+    fn wgpu_query_counts_are_read_without_waiting() {
+        let mut e = Engine::new();
+        let answers = std::sync::Arc::new(d3d9_wgpu::QueryAnswers::default());
+        {
+            let r = real(&mut e);
+            r.stream = Some(Stream::direct(Box::new(
+                super::super::d3d9backend::RealBackend::new(),
+            )));
+            r.wgpu_answers = Some(std::sync::Arc::clone(&answers));
+            r.forwarded.extend([0x10, 0x20]);
+            r.queries_made.insert(0x10, 1);
+            r.queries_made.insert(0x20, 1);
+        }
+        answers.made(0x10, true);
+        answers.made(0x20, false);
+        query_issue(&mut e, 0x10, 2);
+        query_issue(&mut e, 0x10, ISSUE_END);
+        // The backend has not carried the END out yet.
+        assert_eq!(
+            query_get_data(&mut e, 0x10, GETDATA_FLUSH),
+            Some((S_FALSE, 0))
+        );
+        let first = answers.ended(0x10);
+        assert_eq!(query_get_data(&mut e, 0x10, 0), Some((S_FALSE, 0)));
+        answers.post(0x10, first, 77);
+        assert_eq!(query_get_data(&mut e, 0x10, GETDATA_FLUSH), Some((0, 77)));
+        assert_eq!(query_get_data(&mut e, 0x10, 0), Some((0, 77)));
+        // A second END: its own count, not the first's.
+        query_issue(&mut e, 0x10, ISSUE_END);
+        assert_eq!(query_get_data(&mut e, 0x10, 0), Some((S_FALSE, 0)));
+        let second = answers.ended(0x10);
+        answers.post(0x10, second, 5);
+        assert_eq!(query_get_data(&mut e, 0x10, 0), Some((0, 5)));
+        // An event query: the model answers.
+        query_issue(&mut e, 0x20, ISSUE_END);
+        assert_eq!(query_get_data(&mut e, 0x20, 0), None);
+        // Destroyed and made again at the same address before the backend got there.
+        forget(&mut e, 0x10);
+        real(&mut e).forwarded.insert(0x10);
+        real(&mut e).queries_made.insert(0x10, 2);
+        query_issue(&mut e, 0x10, ISSUE_END);
+        assert_eq!(query_get_data(&mut e, 0x10, 0), Some((S_FALSE, 0)));
     }
 
     /// The same on a real device with the render thread: the occlusion query's result comes

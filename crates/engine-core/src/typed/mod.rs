@@ -41,6 +41,7 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(any(test, feature = "test-support"))]
 pub mod diff;
 pub mod leaf;
+pub mod moved;
 
 /// A family's bit in the per-engine flag words. Every family has its own, for good: it is written
 /// in code at each [`typed_call!`](crate::typed_call) of the family.
@@ -57,6 +58,11 @@ impl FamilyId {
     #[inline(always)]
     pub(crate) const fn bit(self) -> u32 {
         1 << self.0
+    }
+
+    /// Its number (what the poison of its moved fields names, [`moved::poison`]).
+    pub const fn number(self) -> u8 {
+        self.0
     }
 }
 
@@ -100,6 +106,10 @@ pub struct Family {
     pub past_gate: bool,
     /// The threads it runs on ([`Threads`]).
     pub threads: Threads,
+    /// Its code reads and writes its own objects through the stage-2 store ([`moved::Store`]), so
+    /// the switch's `dual`, `moved` and `freed` forms mean something for it; for any other family
+    /// they are refused ([`parse_switch`]).
+    pub stage2: bool,
     /// The typed functions by exe address, in the form of a unit's `funcs()`.
     pub funcs: fn() -> Vec<(u32, AbiFn)>,
 }
@@ -161,8 +171,14 @@ pub enum Mode {
     /// The typed functions run.
     On,
     /// The typed functions run, and the family's own code keeps both forms live and compares them
-    /// ([`Engine::typed_dual`]).
+    /// ([`Engine::typed_dual`]): stage 2's dual run, the guest form the truth ([`moved`]).
     Dual,
+    /// Stage 2, K1: the family's objects in host memory ([`moved::Slab`]), its K1 stubs and every
+    /// guest allocation it made before still in the game's heap (poisoned), so the heap is as in
+    /// stage 1 ([`moved::Store::Moved`] with shadows).
+    Moved,
+    /// Stage 2, K2: as [`Mode::Moved`], the guest bytes freed (no shadow allocations).
+    Freed,
 }
 
 /// `NV_TYPED`'s answer for each of `families`. `None` or an empty text is the default: a family is
@@ -173,6 +189,9 @@ pub enum Mode {
 /// - `all`: back to the default;
 /// - `<family>`: that family on, past its gate or not (how a family is tried before its gate);
 /// - `<family>:dual`: on, with both forms live;
+/// - `<family>:moved`: on, its objects moved out of the game's heap, the heap kept as stage 1's
+///   (K1, [`Mode::Moved`]);
+/// - `<family>:freed`: on, moved, the guest bytes freed (K2, [`Mode::Freed`]);
 /// - `<family>:off`: that family off.
 ///
 /// An unknown family or mode is an error: a mistyped switch must not leave a comparison run on the
@@ -198,10 +217,13 @@ pub fn parse_switch(spec: Option<&str>, families: &[&Family]) -> Result<Vec<Mode
                 let (name, mode) = match item.split_once(':') {
                     None => (item, Mode::On),
                     Some((name, "dual")) => (name, Mode::Dual),
+                    Some((name, "moved")) => (name, Mode::Moved),
+                    Some((name, "freed")) => (name, Mode::Freed),
                     Some((name, "off")) => (name, Mode::Off),
                     Some((_, other)) => {
                         return Err(format!(
-                            "unknown mode `{other}` in `{item}` (dual or off, or none for on)"
+                            "unknown mode `{other}` in `{item}` (dual, moved, freed or off, or \
+                             none for on)"
                         ))
                     }
                 };
@@ -212,6 +234,12 @@ pub fn parse_switch(spec: Option<&str>, families: &[&Family]) -> Result<Vec<Mode
                         known.join(", ")
                     ));
                 };
+                if matches!(mode, Mode::Dual | Mode::Moved | Mode::Freed) && !families[k].stage2 {
+                    return Err(format!(
+                        "`{item}`: family `{name}` has no stage-2 form yet (its code does not go \
+                         through the store), so it would run as stage 1"
+                    ));
+                }
                 modes[k] = mode;
             }
         }
@@ -229,6 +257,12 @@ pub(crate) struct State {
     allowed: u32,
     /// The families the switch put on `dual`.
     dual: u32,
+    /// The families the switch put on `moved` (K1) and on `freed` (K2).
+    moved: u32,
+    freed: u32,
+    /// The moved families' slab, stubs and dual run ([`moved::Moved`]): made when any family is in
+    /// a stage-2 form, shared by every real thread's engine.
+    space: Option<&'static moved::Moved>,
     /// The addresses of the families that are on, with the family's bit.
     pub(crate) members: AddrMap<u32, u32>,
     /// The differential test's direct run: every `typed_call!` goes direct with the call log on,
@@ -263,9 +297,18 @@ impl State {
             direct: self.direct,
             allowed: self.allowed,
             dual: self.dual,
+            moved: self.moved,
+            freed: self.freed,
+            space: self.space,
             members: self.members.clone(),
             ..State::default()
         }
+    }
+
+    /// Whether `addr` is a member of a family that may go direct on this engine: registering over
+    /// it would send the whole family by address ([`State::replaced`]).
+    pub(crate) fn is_member(&self, addr: u32) -> bool {
+        self.allowed != 0 && self.members.contains_key(&addr)
     }
 
     /// Something was registered over `addr`. A member's family then goes by address for the rest
@@ -335,6 +378,23 @@ impl Engine {
         self.typed.forced
     }
 
+    /// A direct `typed_call!`'s step of the thread host's time slice, as [`Engine::call`] counts a
+    /// call by address: the slice counted down, or, used up, its hook run at `addr`. So the stepped
+    /// threads hand over where the calls by address put them, and a repeatable run with a family on
+    /// is the run with it off. Without slicing (`slice_hook` unset, as with real threads) a test
+    /// of the hook and nothing more.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn typed_slice_step(&mut self, addr: u32) {
+        if let Some(hook) = self.slice_hook {
+            if self.slice_left == 0 {
+                hook(self, addr);
+            } else {
+                self.slice_left -= 1;
+            }
+        }
+    }
+
     /// The differential test's direct run: a direct `typed_call!` shows in the call log and the
     /// call hook as the call by address does, so the two runs compare call for call.
     #[doc(hidden)]
@@ -379,6 +439,65 @@ impl Engine {
     #[inline]
     pub fn typed_dual(&self, family: FamilyId) -> bool {
         self.typed.dual & family.bit() != 0
+    }
+
+    /// Whether any family runs its dual run: the game's threads then stay stepped, so each paired
+    /// access has no other thread between its two halves.
+    pub fn typed_any_dual(&self) -> bool {
+        self.typed.dual != 0
+    }
+
+    /// What the switch says about `family` on this engine.
+    pub fn typed_mode(&self, family: FamilyId) -> Mode {
+        let bit = family.bit();
+        if self.typed.dual & bit != 0 {
+            Mode::Dual
+        } else if self.typed.moved & bit != 0 {
+            Mode::Moved
+        } else if self.typed.freed & bit != 0 {
+            Mode::Freed
+        } else if self.typed.allowed & bit != 0 || self.typed.members.values().any(|&b| b == bit) {
+            Mode::On
+        } else {
+            Mode::Off
+        }
+    }
+
+    /// The store `family`'s typed code makes its new objects in ([`moved::Store`]): the guest one
+    /// unless the family is in a stage-2 form.
+    #[inline]
+    pub fn typed_store(&self, family: FamilyId) -> moved::Store {
+        let bit = family.bit();
+        let Some(moved) = self.typed.space else {
+            return moved::Store::Guest;
+        };
+        if self.typed.dual & bit != 0 {
+            moved::Store::Dual { moved, family }
+        } else if (self.typed.moved | self.typed.freed) & bit != 0 {
+            moved::Store::Moved {
+                moved,
+                family,
+                shadows: self.typed.moved & bit != 0,
+            }
+        } else {
+            moved::Store::Guest
+        }
+    }
+
+    /// The moved families' slab, stubs and dual run, when any family is in a stage-2 form.
+    pub fn moved(&self) -> Option<&'static moved::Moved> {
+        self.typed.space
+    }
+
+    /// The switch's work with `spec` for `families`, on an engine none has been applied to yet: a
+    /// test that runs one engine in each form (`NV_TYPED` is read once per process).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn typed_apply_for_test(&mut self, families: &[&Family], spec: &str) {
+        assert!(
+            self.typed.members.is_empty(),
+            "the switch was applied to this engine already"
+        );
+        apply_families(self, families, Some(spec));
     }
 
     /// Brings the direct flags up to the diagnostics: clear while any is on.
@@ -443,11 +562,30 @@ pub fn apply(e: &mut Engine) {
     apply_families(e, &families, switch_for(switch_text(), compared));
 }
 
+/// The dual run's line for the status line and the run's end: for each family in its dual run on
+/// `e`, how many words it compared and how many differed (a gate passes with differences 0 and
+/// comparisons above 0). `None` when no family is in its dual run.
+pub fn dual_line(e: &Engine) -> Option<String> {
+    let moved = e.moved()?;
+    let provided = PROVIDED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let parts: Vec<String> = FAMILIES
+        .iter()
+        .copied()
+        .chain(provided)
+        .filter(|f| e.typed_dual(f.id))
+        .map(|f| {
+            let (compared, differed) = moved.dual.counts(f.id);
+            format!("{}: {compared} compared, {differed} differed", f.name)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("Dual run: {}.", parts.join("; ")))
+}
+
 /// [`apply`] with the table and the switch given.
 pub(crate) fn apply_families(e: &mut Engine, families: &[&Family], spec: Option<&str>) {
     check_table(families).unwrap_or_else(|why| panic!("{why}"));
     let modes = parse_switch(spec, families).unwrap_or_else(|why| panic!("NV_TYPED: {why}"));
-    let (mut allowed, mut dual) = (0, 0);
+    let (mut allowed, mut dual, mut moved, mut freed) = (0, 0, 0, 0);
     for (family, mode) in families.iter().zip(modes) {
         if mode == Mode::Off {
             continue;
@@ -464,12 +602,21 @@ pub(crate) fn apply_families(e: &mut Engine, families: &[&Family], spec: Option<
             e.register(addr, f);
         }
         allowed |= bit;
-        if mode == Mode::Dual {
-            dual |= bit;
+        match mode {
+            Mode::Dual => dual |= bit,
+            Mode::Moved => moved |= bit,
+            Mode::Freed => freed |= bit,
+            Mode::On | Mode::Off => {}
         }
     }
     e.typed.allowed = allowed;
     e.typed.dual = dual;
+    e.typed.moved = moved;
+    e.typed.freed = freed;
+    // The slab and the stubs, before any game thread starts (they are shared from then on).
+    if dual | moved | freed != 0 && e.typed.space.is_none() {
+        e.typed.space = Some(moved::Moved::leak());
+    }
     e.typed_sync();
 }
 
@@ -499,6 +646,7 @@ macro_rules! typed_call {
             if cfg!(debug_assertions) && $e.typed_noting_direct() {
                 $e.typed_note_direct($addr, &words);
             }
+            $e.typed_slice_step($addr);
             $($f)::+($e)
         } else {
             $crate::abi::RetVal::from_ret($e.call($addr, &words))
@@ -517,6 +665,7 @@ macro_rules! typed_call {
             if cfg!(debug_assertions) && $e.typed_noting_direct() {
                 $e.typed_note_direct($addr, &$crate::args![$($bound),*]);
             }
+            $e.typed_slice_step($addr);
             $($f)*($e, $($bound),*)
         } else {
             $crate::abi::RetVal::from_ret($e.call($addr, &$crate::args![$($bound),*]))
@@ -556,6 +705,7 @@ mod tests {
         id: FAMILY,
         past_gate: false,
         threads: Threads::Both,
+        stage2: true,
         funcs,
     };
     static PAST_GATE: Family = Family {
@@ -563,6 +713,7 @@ mod tests {
         id: FamilyId::new(4),
         past_gate: true,
         threads: Threads::Both,
+        stage2: false,
         funcs: || vec![],
     };
 
@@ -602,13 +753,14 @@ mod tests {
         static CALLS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Records every call by address with no per-call diagnostic on: a used-up slice asks the hook
-    /// at each call, on [`Engine::call`]'s fast path.
+    /// Records every step of the time slice with no per-call diagnostic on: a used-up slice asks the
+    /// hook at each call by address, on [`Engine::call`]'s fast path, and at each direct call
+    /// ([`Engine::typed_slice_step`]).
     fn record_call(_: &mut Engine, addr: u32) {
         CALLS.with(|c| c.borrow_mut().push(addr));
     }
 
-    /// What one engine does: (the answer, the calls by address in order, the words logged).
+    /// What one engine does: (the answer, the slice's steps in order, the words logged).
     fn observe(e: &mut Engine) -> (u32, Vec<u32>, Vec<(u32, Vec<u32>)>) {
         CALLS.with(|c| c.borrow_mut().clear());
         e.slice_hook = Some(record_call);
@@ -625,7 +777,8 @@ mod tests {
     /// The acceptance test of the seam: with no family, or the family off, a caller that goes
     /// through `typed_call!` makes the same calls in the same order with the same words as the
     /// same caller written with `e.call`. The family on (direct) shows the test can see a
-    /// difference.
+    /// difference, in the answer and the words; its direct call still steps the time slice where the
+    /// call by address did, so the stepped threads hand over at the same points.
     #[test]
     fn with_no_family_or_off_the_same_calls_in_the_same_order() {
         let want = observe(&mut engine(plain()));
@@ -648,17 +801,35 @@ mod tests {
             assert_eq!(observe(&mut off), want, "{spec:?}");
         }
 
-        // On: the typed answer, and the leaf is no longer a call.
+        // On: the typed answer; the leaf is a Rust call, which steps the slice at its address as the
+        // call by address did.
         let mut on = engine(typed());
         apply_families(&mut on, &[&STAND_IN], Some("stand_in"));
         let (answer, calls, log) = observe(&mut on);
         assert_eq!(answer, 1005 + 2010);
-        assert_eq!(calls, [CALLER, OTHER]);
+        assert_eq!(calls, [CALLER, LEAF, OTHER]);
         // With the log on it is a call again, to the typed version: every tool sees it.
         assert_eq!(
             log,
             [(CALLER, vec![5]), (LEAF, vec![5]), (OTHER, vec![1005]),]
         );
+    }
+
+    /// A direct call counts the time slice down as the call by address does: the caller with the
+    /// family on leaves the same slice as with it off (three calls: the caller, the leaf, the other).
+    #[test]
+    fn a_direct_call_counts_the_slice_as_a_call_by_address_does() {
+        fn no_switch(_: &mut Engine, _: u32) {}
+        let left = |spec: Option<&str>| {
+            let mut e = engine(typed());
+            apply_families(&mut e, &[&STAND_IN], spec);
+            e.slice_hook = Some(no_switch);
+            e.slice_left = 100;
+            e.call(CALLER, &[5]);
+            e.slice_left
+        };
+        assert_eq!(left(Some("off")), 97);
+        assert_eq!(left(Some("stand_in")), 97);
     }
 
     /// Which families are past their gate, and so on with no switch: `leaves` since G1 (2026-11-06), the rest
@@ -908,6 +1079,12 @@ mod tests {
         assert_eq!(parse(Some("off")), Ok(vec![Off, Off]));
         assert_eq!(parse(Some("stand_in")), Ok(vec![On, On]));
         assert_eq!(parse(Some("stand_in:dual")), Ok(vec![Dual, On]));
+        assert_eq!(parse(Some("stand_in:freed")), Ok(vec![Freed, On]));
+        // A stage-2 form only for a family whose code goes through the store.
+        for spec in ["past_gate:dual", "past_gate:moved", "past_gate:freed"] {
+            let why = parse(Some(spec)).unwrap_err();
+            assert!(why.contains("no stage-2 form"), "{why}");
+        }
         assert_eq!(parse(Some("past_gate:off")), Ok(vec![Off, Off]));
         assert_eq!(parse(Some("off, stand_in")), Ok(vec![On, Off]));
         assert_eq!(parse(Some("stand_in,off")), Ok(vec![Off, Off]));
@@ -1000,6 +1177,7 @@ mod tests {
             id: FAMILY,
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![],
         };
         static SAME_NAME: Family = Family {
@@ -1007,6 +1185,7 @@ mod tests {
             id: FamilyId::new(9),
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![],
         };
         assert!(check_table(&[&STAND_IN, &PAST_GATE]).is_ok());
@@ -1062,6 +1241,7 @@ mod tests {
             id: FamilyId::new(5),
             past_gate: true,
             threads: Threads::Both,
+            stage2: false,
             funcs,
         };
         let mut e = engine(plain());
@@ -1081,6 +1261,7 @@ mod tests {
             id: FamilyId::new(30),
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![],
         };
         provide(&ABOVE);
@@ -1103,6 +1284,7 @@ mod tests {
             id: FamilyId::new(29),
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![],
         };
         static SECOND: Family = Family {
@@ -1110,6 +1292,7 @@ mod tests {
             id: FamilyId::new(29),
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![],
         };
         provide(&FIRST);
@@ -1200,6 +1383,7 @@ mod tests {
             id: FamilyId::new(6),
             past_gate: false,
             threads: Threads::Both,
+            stage2: false,
             funcs: || vec![crate::entry!(0x00ff_0000, typed_leaf(u32) -> u32)],
         };
         provide(&CHILD);

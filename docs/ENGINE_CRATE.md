@@ -430,8 +430,10 @@ Rust, a family of functions at a time. `engine_core::typed` is the seam it plugs
 family is `leaves` (`typed/leaf.rs`): the small functions the translations call most, on since its
 speed gate passed (G1, 2026-11-06: Goodsprings +7.1%, Doc's room +3.0%). It is no longer the only one on: by default
 `leaves`, `topic_search`, `topic_order` and, since their speed gate (2026-11-08), `lockfree`, `culling`,
-`pathing`, `shader`, `crt` and `dispatch` are on (below); `NV_TYPED=off` turns every family off, and
-`<family>:off` one. A run compared call for call with the original's record (nv-trace's `NV_TRACE_OUT`,
+`pathing`, `shader`, `crt` and `dispatch` are on, and since their gates `render` (2026-11-09), `draw`, `scene`,
+`particles`, `collision` and `multibound` (2026-11-10) (below); `NV_TYPED=off` turns every family off, and
+`<family>:off` one. A family merged off (`geometry`, `animation`, `draw_f`, below) stays off until its gate, and
+`NV_TYPED=<family>` turns it on. A run compared call for call with the original's record (nv-trace's `NV_TRACE_OUT`,
 `NV_TRACE_LIST`) has every family off unless `NV_TYPED` says otherwise (`typed::switch_for`).
 The second is `topic_search` (`crates/engine-fallout-forms/src/topic_search.rs`, provided from that
 crate): the search for the topic that holds a topic info (`TESTopic::GetOwnerTopic`) and the functions
@@ -461,8 +463,10 @@ string routines; its tests are `crates/engine/tests/typed_crt.rs`.
 And `dispatch` (same crate, id 9): a speed batch picked by calls by address a frame in town, each function with the callers whose call sites
 make those calls, so they become Rust calls (the transforms' and matrices' arithmetic, the scene graph's
 controller and children walks and getters, counted references, the recursive spin lock, the AI's and the
-inventory's getters), stage 1 (its calls into `leaves`, `culling` and `pathing` go direct only when those
-are on); its tests are `crates/engine/tests/typed_dispatch.rs`. And `shader` (same crate, id 17): the shader
+inventory's getters; since 2026-11-10 also the word map's lookup `00853130`, which a quicksave makes about
+230,000 times in its frame through the save's 37-bucket references map), stage 1 (its calls into `leaves`,
+`culling` and `pathing` go direct only when those are on); its tests are
+`crates/engine/tests/typed_dispatch.rs`. And `shader` (same crate, id 17): the shader
 set-up and batch renderer (render state setters and caches, the batch renderer's lists and passes, the
 accumulator's registration and the shaders' per-geometry set-ups), stage 1; its tests are
 `crates/engine/tests/typed_shader.rs`. These six are on since their speed gate, taken together (2026-11-08,
@@ -494,6 +498,154 @@ through its vtable), and `NiTriStrips`' immediate draw the packed draw when the 
 do. Speed (2026-11-10, the crowded street view, main's default against it, BAAB): neutral, crowded 15.25 to
 15.27 ms a frame, the sky 6.54 to 6.46 ms, both inside the spread between two runs of the same exe. The time
 moved from the translations to the typed code; the Direct3D 9 stream is byte-identical with the families on or off.
+And `draw` (same crate, id 18): the main world draw, typed as the groundwork for running that draw on its own
+thread. Group A, its drivers: the world pass's two halves and the secondary scenes' draw (`00b6c0d0`: water
+reflections, menus), the accumulator's render mode draw and finish, its camera in and out (`00d47a40`,
+`00aa0fe0`), the held accumulator (`00b54b10`), render mode 0's two halves, the pass type range draw that
+interleaves the batch renderers, the register group draw, the alpha sort, the decal pass, the fog-coloured
+ambient (`00bbb840`), the alpha group draw with its distances and clears, `RenderNextAlpha`, a holder's draw, the
+shadow types' group-clearing draw, and the camera handed to the scene renderer (`004e9bb0`, `004e9c90`) with the
+camera getters it reads (`004a0d10`, `0045bbe0`, `0045bb80`, `0045bba0`, `004e9c10`, `004e9c50`). Members used
+outside the world draw too, so that `draw:off` gives those callers the translations again: the camera hand-over
+and getters (`004e9bb0`, `004e9c90`, `004e9c10`, `004e9c50`; the other four game-wide), the accumulator's camera in
+and out (`00d47a40`, `00aa0fe0`), the fog ambient (`00bbb840`), the held accumulator (`00b54b10`) and the
+secondary scenes' draw (`00b6c0d0`). Group D, the geometry paths the batch renderer's draws reach: the geometries'
+immediate draws (the triangle shape, the segmented shape with its segment merge, the particles), the renderer's
+shape, skin partition and points draws with the particles' quad builders and vertex declarations, the skinned
+shader classes' bone set-up and the renderer's bone-matrix fill, a skin partition's buffer pack, a shader
+declaration's stream pack and build, the chips and the vertex lock, and the geometry data getters. Used outside
+the world draw too (`draw:off` gives those callers the translations again): the geometry data getters, which sit in
+the data classes' vtables (the vertex count `00a669e0` in seven, the strip lists `00a75f10` in 24) and are asked by
+whoever holds a data object, the strip lists getter also called directly from nine places (among them the
+tangent-space creation, `PackGeometryBuffer`, `PrecacheGeometry`, the cached geometry and `ClipMesh`); the lock,
+unlock and chip functions; and the folded "false" (`0047c850`). Group B, the pass begin and end the batch
+renderer's draws reach through a shader's vtable: `BSShader`'s pass slots as the shadow light shader keeps them (the
+render states set and put back, the alpha function and test, the end's states and their restore, the begin's end),
+the render state put back by state (`00b98610`), the masked stage binding (`00be21b0`), the fog property
+(`00b55520`), the shadow light shader's pass choice, pass constants, type group begins, per-geometry set-ups, kinds 1
+to 5 tail and land toggles, a lighting property's fade (`00b66b80`) and the vertex shader's two constant setters
+(`00e89ba0`, `00e89c70`). Used outside the world draw too (`draw:off` gives those callers the translations again):
+`GetFogProperty` (`00b55520`), the lighting fade (`00b66b80`, in the lighting properties' vtables), the constant
+setters (every shader's constant maps), `00b98610`, the `BSShader` slots every `BSShader` class shares, and
+`00be21b0` (slot 0x10c of many shaders' vtables). Group E, the D3DX import thunks the typed families call
+(`D3DXMatrixMultiplyTranspose` `00ee6dfe`, `Vec3Normalize` `00ee6dec`, `Vec3TransformNormal` `00ee6df2`,
+`Vec3TransformCoord` `00ee6df8`, `MatrixTranspose` `00ee6dd4`, `MatrixInverse` `00ee6dda`, `MatrixMultiply`
+`00ee6de0`, `PlaneNormalize` `00ee6dce`, `PlaneTransform` `00ee6dc8`): each calls its import slot, which the
+platform layer answers (part crates do not depend on `engine-platform`, so the typed callers save the thunk's call,
+not the import's); every caller in the exe reaches them, so `draw:off` gives all of them the translations again.
+The tests: groups A's and B's in `crates/engine/tests/typed_shader.rs` (the shader family's world), groups D's and
+E's in `crates/engine/tests/typed_draw.rs`.
+The accessors: what the drivers and the alpha pass read that the rest of the frame changes goes through
+`draw::packet`, and what they write that is their own through `draw::own`, one section per condition of the
+pipeline probe that lives there (the pass lists the next frame's registration fills again with the range draw's
+cursors, blend, clip and depth state and the device's transform, streams and indices, the changed flags of the
+geometry drawn, the blocks the draw frees and allocates, the reference counts). Not routed yet: the packing's own
+objects (the buffer data's streams and chips, the shader declaration, the dynamic geometry group, the vertex
+manager's staging block), which `draw::packing` and `draw::packed` read and write in place; the exe's constant
+data (the -FLT_MAX and 0.001 the alpha pass compares with, the colour scale, the bone scale bounds, the far distance
+with no fog distances, the 1.0 at `01012070`); and what group B reads that is filled at load (the shader package's
+tables, the passes' contents, the shaders' own fields, the shader property's texture source and land table bytes,
+the constant map entries' fields and the pass type tables, the default stage texture `011f951c`, the fade distances
+`011f9454`/`011f9458`, the element bits `011ae640`, the constant kinds `011f5fc4`, the vertex shader's renderer's
+device word +0x10f8); group B's other reads and writes, its own writes read back included, go through the two
+accessor files. A later step changes those two files to feed the draw from a copied packet. On since its gate
+(the recorded street run byte-identical with `NV_TYPED=draw:off`); not a speed change by itself.
+And `scene` (same crate, id 19), the first group of the frame's update half: the downward update pass of the classes
+beside `NiNode` (a plain object such as a geometry, the fade node's slot, the particle system), the update's entry, the
+skinned geometry's bound and the transform inverse it needs; the typed `NiNode` pass sends each child to the scene
+family's slot dispatch (`scene::walk::downward`), so the walk stays a Rust call across those classes, and
+`NiGeometry::UpdateWorldBound` calls the skinned bound directly. Its tests are in `crates/engine/tests/typed_dispatch.rs`.
+On since its gate (2026-11-10: the differential tests with each planted mutant caught, and the recorded street run
+byte-identical with `NV_TYPED=scene:off` in the fixes and vanilla presets); not a speed change by itself.
+And `particles` (same crate, id 20), the update half's second group: a particle system's update, from its update
+controller (`NiPSysUpdateCtlr::Update`, which the typed controller walk calls directly when a controller's slot holds
+it) through `NiParticleSystem::UpdateSystem` and `Do_UpdateSystem` to the modifiers that move, age, turn, size, colour
+and bound the particles (bomb, position, age and death with the data's particle removal, rotation, grow and fade,
+bound update with its skip, Bethesda's simple colour), each called directly when the modifier's update slot holds it;
+another modifier (gravity, a mesh or strip one, a mod's) goes through its vtable as before. With it, `scene` holds the
+queued node updates main runs after the frame is shown (`00552570`: the scene graphs the AI threads changed, each
+queued node's geometries given their update, which reaches the scene family's update entry directly). Its tests are
+`crates/engine/tests/typed_particles.rs` and, for the queue, `typed_dispatch.rs`. On since its gate (the differential
+tests with each planted mutant caught, and the recorded street run byte-identical with
+`NV_TYPED=particles:off,scene:off` in the fixes and vanilla presets); not a speed change by itself.
+And `collision` (same crate, id 21), the update half's third group: the Havok collision objects' part of the scene
+graph's world-data update. `NiAVObject::UpdateWorldData` (culling family) calls a blend collision object's update
+directly when the object's slot holds it; the blend collision object (`bhkBlendCollisionObject::UpdateWorldData` and
+`hktoNiTransform`, the actors' ragdoll bones) moves its node to its Havok body or the body to the node, blending the
+two lane by lane as the exe's SSE does; a collision object moves its body to its node (`bhkCollisionObject::
+NitohkTransform`) with the quaternion of the node's rotation (`NiQuaternion::FromRotation`) and the body's linear
+velocity it reads. `bhkCollisionObject::hktoNiTransform` stays by address (the fixes preset's smooth physics drawing
+replaces it), as do the Havok calls (motion type, hard keyframe, the velocities' set-up). Its tests are
+`crates/engine/tests/typed_collision.rs`. On since its gate (the differential tests with each planted mutant caught,
+and the recorded street run byte-identical with `NV_TYPED=collision:off` in the fixes and vanilla presets); not a speed
+change by itself.
+The three update-half families (`scene`, `particles`, `collision`) keep the exact x87 helpers instead of the float
+rule's `f64` locals rounded at each `float` store (ADR-0014, below): they run on the main thread at 24-bit precision,
+where an `f64` local rounded only at the store can differ in the last bit from the exe, which rounds at every step, and
+byte identity with the translations needs each step rounded as the exe rounds it. The recording the rule asks for is
+each family's gate: the recorded street run, byte-identical with `NV_TYPED=scene:off`, `particles:off,scene:off` and
+`collision:off` in the fixes and vanilla presets.
+And `multibound` (same crate, id 22), the update half's fourth group: the two passes main runs over the loaded world
+once a frame that keep the multibound culling current. The reset pass (`0045bc80`) takes every object's multibound
+shape back to "not tested"; the visibility pass (`0045b070`) tests each again from the camera through the shadow
+scene node's test of one multibound node (`00b5bbe0`): the shape against the culling process's frustum
+(`BSMultiBoundAABB::WithinFrustum`, the culling family's, called directly when the shape's slot holds it), then
+against the portal graph's active occluders. The objects: an interior cell's multibound nodes, or each loaded grid
+cell's multibound nodes and land; the shadow scene node's child 6's children; the water objects. The small getters
+they call for each object, cell and water entry are typed with them (some shared by identical code with other
+classes, so every caller reaches the typed one). By address: the culling process's set-up, the terrain manager's
+calls, `VisibleAgainstActiveOccluders`, the scene node's candidate and the portal graph's held, queued and tracked
+objects' calls. Typing it found a translation bug: the exe keeps the camera position's three words right after its
+0x90-byte culling process, and the object test reads the process's word +0x90 as its mode, which is the position's
+x; the translation kept them in Rust locals, so it read whatever the stack held there. Fixed in both. Its tests are
+`crates/engine/tests/typed_multibound.rs`. On since its gate (the differential tests with each planted mutant caught,
+and the recorded street run byte-identical with `NV_TYPED=multibound:off` in the fixes and vanilla presets);
+integers only, not a speed change by itself.
+And `geometry` (same crate, id 23): the code that reads and writes `NiGeometryData`'s arrays (positions, normals
+with the binormals and tangents after them, colours, texture coordinates), typed so that stage 2 can keep those
+arrays outside the 32-bit space (about 23 to 40 MB of the guest heap on the census route, and what mesh mods grow).
+Its first batch is the renderer's packing of the arrays into a vertex buffer: the element pack that picks an array
+for a declaration entry (the draw family's stream pack calls it), the six converters that can receive one, the
+texture set getter and the fixed-function packer with its strided copy. The second: the bound of a run of points
+(`NiBound::ComputeFromData`), the geometry data's setters of a set of arrays (`Replace`, which the renderer's
+release of the arrays a static mesh does not keep goes through, `SetData`, `ReplaceData`) and the geometry morpher
+(`Update`, `GenMorphInterp`, `GetVertexData` and the weighted add of a target). The third: where the arrays begin
+and end (the load from a stream, which FaceGen's deep copies of a head go through, the save with its texture
+coordinates' write, the destructor body, the normals' own allocation, method setter and release), the tangent space a
+lit geometry gets at load (`BSShaderManager::CreateTangentSpaceSimple`) and the pick of a geometry's triangles (the
+general pick and the two it hands strips and shapes). Its tests are `crates/engine/tests/typed_geometry.rs`. Off until its gate (`NV_TYPED=geometry` turns it on).
+And `animation` (same crate, id 24), the update half's fifth group: a skeleton's bones moved from their animation
+each frame. `BSBipNode::UpdateAllButBip` walks a bip node's controllers; a multi-target transform controller
+(`BSTransCon::UpdateAllButTarget`) updates each bone it drives from its interpolator's transform
+(`NiBlendTransformInterpolator::Update` with its single-value store), and the transform's translation, rotation (from
+its quaternion, `NiQuaternion::ToRotation`) and scale go into the bone; with the small tests and setters they make.
+`UpdateAllButTarget` and the blend interpolator's `Update` are typed but reached by address only: kNVSE hooks both
+(`overridable.tsv`), so a built-in may replace them. By address as well: the blend of several interpolators and the
+weights' normalisation, an interpolator's own `Update` (the key lookups), the quaternion's normalisation, the
+transform's getters and the bone's setters. The translations keep their plain calls of the family's small functions;
+only the bip node's walk calls `UpdateAllButTarget` by address (in every build, so kNVSE's hook runs from there too). Its tests are `crates/engine/tests/typed_animation.rs`. Merged off
+(AGENT-RULES.md, "Typed code merges OFF first"): `NV_TYPED=animation` turns it on until a batch gate runs the
+recorded street run with it on against off; x87 code with the exact helpers, as the other update-half families.
+And `draw_f` (same crate, id 25), group F of the world draw's worklist: the small helpers the typed families called
+by address most. The float maximum (`00404010`) and minimum (`0040ebd0`); the class test with its null check
+(`0043b300`, which calls the dispatch family's `NiObject::IsKindOf`); the list node pool's allocation (`0043a010`:
+under the pool's lock, the dispatch family's, the pool refilled by address when empty, its first node taken and
+cleared). The draw, shader and render families call them with `typed_call!`. The other callers that reach them by address
+(most: the AI, the menus, the sound, the forms) get the typed ones too when it is on; the few translations that
+call them as Rust functions keep the translation, which does the same. Merged off: on its
+differential tests, its planted mutants and review, with a later gate to turn it on (`NV_TYPED=draw_f` until then).
+While it is on, the translation's speech diagnostic (`NV_SPEECH_CHECK`, not the exe's) takes no notes at the node
+allocation. Its tests are in `crates/engine/tests/typed_draw.rs`.
+And `anim_keys` (same crate, id 27): the code that reads and writes the key arrays an animation keeps
+(`NiTransformData`'s rotation, position and scale keys, about 12 MB of the guest heap on the smoothness route), typed so
+that stage 2 can keep them outside the 32-bit space as plain byte buffers. Its first batch is what the touch census saw
+reaching rotation keys: `NiQuaternion`'s constructor from four floats, its negation, `Slerp` with its parameter
+correction, `NiRotKey::GenInterp` with the key search the `GenInterp` functions share, and the preparation of a
+rotation key array (neighbours in one hemisphere, `W` clamped). The key types' interpolation functions,
+`NiQuaternion::FastNormalize` and the loading of the keys stay by address. `anim_keys::Keys` gives a key's address,
+word and time; the quaternion copies, the clamp of `W` and the negation's copy back still read and write at those
+addresses directly, and `GenInterp` hands raw key addresses to the interpolation functions: stage 2 routes those
+too. Its tests are `crates/engine/tests/typed_anim_keys.rs`. Off until its gate (`NV_TYPED=anim_keys` turns it on).
 
 **The switch.** `NV_TYPED` is read once per process, and `Engine::new` runs `typed::apply` after
 all registration: each family that is on is registered over the translations with
@@ -506,7 +658,9 @@ is a comma-separated list, read left to right:
 | `off` | Every family off: the game runs the translations |
 | `all` | Back to the default |
 | `<family>` | That family on, past its gate or not |
-| `<family>:dual` | On, with both forms live, for families that keep them (`Engine::typed_dual`) |
+| `<family>:dual` | On, with both forms live, for families that keep them (`Engine::typed_dual`): stage 2's dual run, below |
+| `<family>:moved` | On, its objects moved out of the game's heap, the heap kept as stage 1 leaves it (K1, below) |
+| `<family>:freed` | On, moved, the guest bytes freed (K2, below) |
 | `<family>:off` | That family off |
 
 Anything else stops the start with a message. A family is a row in `typed::FAMILIES`; a family in a
@@ -566,18 +720,28 @@ code is the same as before, instruction for instruction, apart from field offset
 by 48 bytes). The full path, taken on a cache miss or with a diagnostic on, gains one load and one
 branch while no family is on. A `typed_call!` with the flag set is one load and one test before the
 Rust call, in play and release builds, and the checks above exist only with debug assertions on. A
-direct call doesn't count against the thread host's time slice and isn't on `call_stack`.
+direct call steps the thread host's time slice as a call by address does (`Engine::typed_slice_step`:
+the slice counted down, or its hook run when it is used up), so the stepped threads of a repeatable
+run hand over where the calls by address put them; it isn't on `call_stack`. Until 2026-11-10 it
+didn't step the slice: the scene family's recorded run moved the AI and loader threads' turns and
+the heap with them. One difference stays: a callee a translation reaches with a plain Rust call
+while typed code calls it with `typed_call!` steps once more on the typed side (the dispatch
+family's plain callees `004019d0`, `00408860`, `00476930`, `00476980`, `004769c0`, `004f0000`,
+`004a3e90`, `00560e50`), which matters only to a comparison of dispatch itself on against off.
 
-The thread host keeps a count of calls by address (`Threads::calls`), and `NV_MOVE_THREADS` prints it
-with who ran when, per frame, beside the status line (`thread calls: N order: id:calls .. f ..`).
+The thread host keeps a count of the slice's steps (`Threads::calls`: calls by address and direct
+calls), and `NV_MOVE_THREADS` prints it with who ran when, per frame, beside the status line
+(`thread calls: N order: id:calls .. f ..`). The diagnostic only peeks at the clock: a reading would
+move a repeatable run's clock, and the status line comes every 5 s of wall time, at frames that
+differ between runs.
 
 **A risk for later.** The thread host hands over at calls by address: the time slice counts them and
 its hook runs at them. A typed loop that waits on guest memory for another game thread, making only
 direct calls or none, never reaches that hook, so it hangs where the translation handed off. Such
 a loop has to make a call by address, or the platform wait the exe makes, in each pass. With real
 threads it is also a correctness rule: guest memory is plain loads and stores (`mem.rs`, "Threads"),
-so without an opaque call in the loop the compiler may read the memory once and never again. The same
-count is why each batch of direct calls checks `WAKE_DELAY_CALLS` and the hand-offs per frame.
+so without an opaque call in the loop the compiler may read the memory once and never again. A direct
+call steps the slice but runs nothing else of a call by address, so this holds as before.
 
 Measured on 2026-11-06 (`spread_dispatch_speed`, 48,000 functions registered, 8,000 called, release
 build, the two builds alternating, 8 runs each):
@@ -699,6 +863,15 @@ Diff::new(entry!(0x00abc123, typed_version(Ptr<Thing>, f32) -> f32))
   did, at 20 sites for 17 callees), so the callee's words compare too. `allow_nan_payloads` lets NaN payloads
   differ where the float rule accepts it, in the return and in aligned words of memory and calls; an
   infinity or a number against a NaN still differs.
+- **A float tolerance:** `float_ulps(n)` lets floats differ by up to `n` ulps where native float maths rounds
+  where the exe's x87 code did not (AGENT-RULES "SPEED FIRST"); without it every float compares bit for bit.
+  An aligned word compares as an `f32` within `n` ulps when it reads as one on both sides (zero, an infinity, a
+  NaN of any payload, or a number from 2^-64 to 2^65 that is no mapped address), in memory at every outgoing
+  call (word by word, its other words in the call's hash) and after the call, in a call's words and behind its
+  stack words; ST0 within `n` ulps once both are rounded to an `f32` (a difference the rounding hides counts as one). Small integers (they read as denormals),
+  pointers into mapped memory, tiny flag words and the words from 0xffff0000 up stay exact. The report counts
+  the values let through (`tolerated`) and the largest difference (`largest_ulps`). Logic and integers stay
+  exact, so `n` stays small: an integer that reads as a float in range is let through by up to `n` too.
 - **A function new in the setup:** a setup may register at a family member's or a plain callee's address
   where nothing was, when every side gets the same function: anything else stops the run.
 - **A double in the setup:** over a family's member, or over a callee the translation calls plainly,
@@ -740,7 +913,7 @@ marker elsewhere, in the engine crates, `crates/host` and `viewer`. The rules re
 - `crates/engine-core/data/overridable.tsv` lists the addresses a fix or a built-in can override: the
   plugins' hooked function entries (a lower bound: literal addresses only), the fixes preset's addresses ([FIXES.md](FIXES.md)),
   and the four fixes-preset guards. `typed_call!` may not name one, and typed code may not call one
-  directly. The translations' direct calls to them (138 today, six of them the fixes preset chaining to the translation) are frozen by count: a new one fails,
+  directly. The translations' direct calls to them (139 today, seven of them the fixes preset chaining to the translation) are frozen by count: a new one fails,
   and a removed one asks for the number to be lowered. Moving them to calls by address would change the
   calls the game makes, so it is left for each family's own step.
 - **What stays review-only,** because this reads text: a call through a function pointer or a `let` of
@@ -767,6 +940,87 @@ move out of guest memory needs, and what precision a typed function's floats tak
 on (checking at frees, reporting without stopping) when `NV_BLOCK_CHECK` didn't; that also makes every
 `with_stack` local a heap block, so a tagged stack object's tag ends with its frame. The block check now
 keeps the running function's caller too (the touch census names both).
+
+### Moved families (stage 2)
+
+Stage 2 moves a typed family's objects out of the game's heap ([ADR-0014](adr/0014-typed-migration-in-two-stages.md);
+the steps: the touch census, the creation sites, K1 stubs and the dual run, the save check, K2). What every family
+uses is `engine_core::typed::moved`, tested with a made-up family, so a family reuses it unchanged:
+
+- **The moved area**, `0x10000000..0x20000000`, below the heap (`mem.rs` has the layout): ordinary play never
+  used it, and `VirtualAlloc` at a chosen address fails there. Below 0x80000000, so no handle, token or stub ever
+  has its top bit set. Two shapes of host memory, outside the guest space, behind it:
+  - the **slab** (`0x10000000..0x14000000`): small objects that keep their PC layout (the offsets are the
+    contract: built-in commands, the dual run) and point into each other. Every word an atomic (loads
+    acquire, stores release, compare-and-swap sequentially consistent: what real threads need where the game
+    uses interlocked operations, from the first step); blocks in 16-byte steps, counted by family and tag. A
+    moved object's handle is an address there, which the guest page table never maps, so an untyped read or
+    write of one stops the run naming the address, and a pointer into an object (a link, an element) is a
+    handle too. Its handles cover its bytes, so it is for families whose bytes are few (the lock-free maps);
+  - the **buffers** (`0x14000000..0x18000000`): big arrays behind
+    start-only tokens, 16 bytes of the space each whatever their size (4 M of them), so no 32-bit address
+    inside one exists: typed code reads and writes it by token and offset. Plain bytes copied plainly,
+    ordered by the game's own hand-off between threads, as guest memory's plain accesses are; for arrays
+    written once and read many times (vertex arrays, keys).
+
+  The upper half, `0x18000000..0x20000000`, holds 16-byte **stubs** for moved objects untyped code still
+  calls through their vtable: the vtable, then poison, on a mapped page; a table in host memory gives each
+  stub's handle.
+- **K1 stubs** (`moved::K1`): the object's original guest block stays, with every field untyped code reads; a
+  spare word holds the handle of its moved record (its layout, in the slab, never a guest allocation) and the
+  moved fields hold **poison**, a word in the last 64 KB of the space (never mapped) naming the family and the
+  field: a missed reader that follows it stops there, one that counts with it gets about four billion, and a
+  missed writer shows when the poison is checked.
+- **The store** (`moved::Store`): one code path for every form. The family's typed code reads and writes its
+  own objects, allocates and frees them and makes the calls by address that act on them (a compare-and-swap,
+  a copy) through the store of each operation's root. `Guest` is stage 1. `Moved` puts new objects in the slab;
+  with shadows (K1, `NV_TYPED=<family>:moved`) every guest allocation the family made before is still made, of
+  the same size in the same order, poisoned and freed with its object, so the game's heap and every guest
+  address after it (the Direct3D model's objects, which the recorded stream names by address) stay as they
+  were, and two repeatable runs compare with `cmp`; without (K2, `<family>:freed`) the guest bytes are freed,
+  and the recorded streams compare with handles renamed (`d3d9-stream`'s `wire::compare_renamed`; the
+  `record_compare` example). `Dual` (`<family>:dual`) keeps the guest objects the truth and mirrors each one in
+  the slab: every access is made on both and compared (a word inside a mirrored block compares as the same
+  place in its mirror, so pointer fields need no types), the first 20 differences are printed with the place
+  and the function running, and the status line counts comparisons and differences (`Dual run: ..`). A dual run
+  keeps the game's threads stepped and the render helpers from forking, and runs both halves of each access
+  (the guest effect, often a call by address, and the mirror's) in one turn of the stepped host, its
+  time-slice hook taken out meanwhile: no other thread's access comes between them. (The call must still
+  reach no wait.)
+- **Checks along the way.** K1's destructor half checks the poison (an untyped writer of a moved field stops the
+  run, naming the field and what it wrote) and clears the spare word (a second destruction frees nothing); the
+  moved store stops when typed code reads its own family's poison as a value (a moved field read without
+  `K1::place`). Fault messages name the stage-2 range an access hit (a slab handle, a buffer token, a stub page,
+  the poison area, a freed moved object). No reservation reaches into the last 64 KB (the poison's target), and
+  slab and token pages are never mapped.
+- **Reuse: a quarantine, not the exe's order.** The guest heap reproduces the exe's pools for the objects that
+  stay, so a use after free in game code reads what the exe would have read. A moved family's blocks are not in
+  those pools, so a freed slab block waits, oldest first, until 4 MB of later frees have joined it, every word
+  the freed-block check's word (above the heap, never mapped): a stale handle reads freed words and a pointer
+  taken from them stops at once, and a stale store into one stops the run when the block leaves the
+  quarantine. Freed stubs and buffer tokens wait for 65,536 later ones. A family whose game
+  code reads its objects after freeing them is not moved until that read is typed or fixed.
+- **Buffers under real threads.** A free swaps the bytes out of the table (of two frees at once one wins and the
+  other stops) and keeps them until no thread can be inside an access: the thread host's barrier at a frame's
+  end (once 64 MB wait) with real threads, every frame's end with stepped ones (`Buffers::reclaim`). So only
+  the threads the barrier counts (the game threads and the render helpers) may read or write a buffer; a host
+  thread outside it (the Direct3D 9 stream's render thread, the sound mixer, the save copy-out) never may.
+- The heap census (`NV_CENSUS`) ends with what the slab holds, by family and tag, saying how many of a K1
+  family's blocks keep a shadow in the heap.
+
+A family decides which of its objects move, which fields stay in a K1 stub and which word is spare, which
+allocations are its own, and which of its calls by address act on its own objects. Typed code reached by address
+tests a handle's range (`moved::is_handle`), so code shared with objects that stay needs no second path. Its
+`Family` says `stage2: true` once its code goes through the store; until then the switch refuses
+`<family>:dual`, `:moved` and `:freed` (they would run stage 1 without saying so).
+
+The first family with a stage-2 form is the lock-free maps (`engine-typed`'s `lockfree/store.rs`): their body
+(buckets, node slots, interface managers and their entries, interfaces, nodes, the scans' copies) is the
+family's own and moves whole; the map object stays a K1 stub (made by untyped code, often inside other
+objects), its record holding the node slots (+4), the buckets (+0xc), the delete batch size (+0x10) and the
+interface manager (+0x14), its spare word +0x1c; the vtable, the bucket count, the count and the lock stay
+for the untyped wrappers. The queues share the interface manager's functions and keep theirs in the game's
+memory: an object is made in the store of its root, so a queue's manager stays guest.
 
 ## Checking against the real exe
 

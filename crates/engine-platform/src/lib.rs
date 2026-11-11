@@ -132,6 +132,80 @@ pub struct State {
     pub process: process::Process,
 }
 
+/// What runs before the platform layer ends the process itself, which it does in one place: the
+/// game's window closed (its X button, Alt-F4: `d3d9real`'s window procedure, `WM_CLOSE`). The
+/// host registers the copy-out of saves' flush here (`host::save_out`), so a save handed to its
+/// thread just before is on disk when the process ends. Every other end of a run goes through
+/// the host's own end of main's frames, which flushes too.
+static EXIT_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+
+/// The hooks that run after every [`on_exit`] one ([`on_exit_late`]): the port's own files that
+/// can be made again (the wgpu backend's pipeline cache and list, about 5 MB), so the player's
+/// save is on disk before them, whichever was registered first.
+static LATE_EXIT_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers `hook` to run before the platform layer ends the process ([`EXIT_HOOKS`]).
+pub fn on_exit(hook: fn()) {
+    EXIT_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(hook);
+}
+
+/// Registers `hook` to run before the process ends, after every [`on_exit`] hook
+/// ([`LATE_EXIT_HOOKS`]).
+pub fn on_exit_late(hook: fn()) {
+    LATE_EXIT_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(hook);
+}
+
+/// Runs the hooks [`on_exit`] registered, in order, then those [`on_exit_late`] registered (the
+/// platform layer is ending the process).
+pub fn run_exit_hooks() {
+    let hooks = EXIT_HOOKS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let late = LATE_EXIT_HOOKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    for hook in hooks.into_iter().chain(late) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+mod exit_hook_tests {
+    use super::*;
+
+    static ORDER: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+    fn cache() {
+        ORDER.lock().unwrap().push("cache");
+    }
+
+    fn save() {
+        ORDER.lock().unwrap().push("save");
+    }
+
+    /// A late hook (the wgpu caches) runs after an ordinary one (the saves' flush) even when it
+    /// was registered first, as the wgpu cache's is (at the start; the flush at the first save).
+    #[test]
+    fn the_saves_flush_runs_before_the_caches() {
+        on_exit_late(cache);
+        on_exit(save);
+        run_exit_hooks();
+        let order: Vec<_> = ORDER
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|h| matches!(*h, "save" | "cache"))
+            .collect();
+        assert_eq!(order, ["save", "cache"]);
+    }
+}
+
 /// The [`State`] in an engine's `Kernel::platform`.
 #[inline]
 pub fn state(slot: &Option<Box<dyn std::any::Any>>) -> &State {

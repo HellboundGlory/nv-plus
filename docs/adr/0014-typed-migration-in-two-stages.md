@@ -65,7 +65,20 @@ These are open for the maintainer, and nothing in this record settles them:
 - whether rewriting call sites to typed leaf functions by script counts as the "generated direct
   calls" ADR-0012 skips;
 - how the extender notes' rule that guest memory is the only copy of game state changes once a
-  family has moved.
+  family has moved. Proposed with the lock-free maps' stage-2 form, the first that can move real data
+  (opt-in, `lockfree:moved` or `:freed`), for the maintainer to decide: a moved family keeps its classes' PC
+  layouts as the contract, but its moved fields live outside guest memory; a built-in command reaches such
+  an object only through what stays callable by address (its virtual methods, the family's typed functions
+  at their exe addresses), never by reading or writing the moved fields. What such a read or write does: a
+  moved field read and followed as a pointer stops the run, naming the family and the field (it holds
+  poison, or a handle that is no guest memory); read as a number it silently gives the poison word (+0x10 of
+  a lock-free map reads 0xFFFF0110); a write to a moved field does not stop either: typed code uses the
+  record, so the write is ignored, and it shows only when the object is destroyed (the poison check at
+  detach, for most maps at the game's exit). The fields that do not move (a map's vtable, bucket count,
+  count and lock) stay usable as before. The family's exe addresses are not overridable: a hook there
+  would send the family's calls by address and put untyped code in front of its handles. The objects'
+  guest addresses (K1 stubs) and vtables stay where the game made them. Until a family moves by default,
+  nothing changes for extenders.
 
 ## Consequences
 
@@ -74,7 +87,8 @@ These are open for the maintainer, and nothing in this record settles them:
 - Stage 1 alone does not remove the 4 GB limit, and the migration alone does not reach 200+ fps:
   the plan forecasts about 108 fps in Doc's house and 46 in town, from older uncapped figures; the 2026-11-06 baseline is already about 103 and 45, so the forecast needs redoing. Threads and the render thread have
   to follow; both get easier on typed code.
-- Direct calls change how the thread host's time slice counts calls, so each batch that adds them
-  checks the hand-offs per frame.
+- Direct calls step the thread host's time slice as calls by address do (2026-11-10, after the
+  scene family's recorded run showed the hand-offs moving without it), so a batch of them leaves a
+  repeatable run's hand-offs where they were.
 - The first step adds no cost: `Engine::call`'s fast path is untouched
   ([docs/ENGINE_CRATE.md](../ENGINE_CRATE.md), "Typed code").

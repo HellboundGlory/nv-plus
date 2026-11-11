@@ -35,7 +35,26 @@ lockfree, culling, pathing, shader, crt and dispatch after their speed gate: Goo
 crowded street +10%; docs/ENGINE_CRATE.md, "Typed code"). A tenth, `render` (the render path's stage binding,
 texture lookup, geometry pass, render passes and stream set-up, with direct calls through vtable slots between
 typed functions), is on since 2026-11-09: the whole family on against main's default with it off, the crowded
-street +4.6% (t 10).
+street +4.6% (t 10). An eleventh, `draw` (the main world draw's drivers and alpha pass, the geometry paths
+its draws reach and the shader passes' begin and end, the first step towards drawing on a thread of its own),
+is on after its gate: the recorded street run byte-identical with it off; no speed claim of its own.
+The update half (what main runs besides drawing) began on 2026-11-10 with `scene`: the scene graph's
+downward update pass across geometries, fade nodes and particle systems, and the skinned bound, on once proven
+identical (differential tests, the recorded run byte-identical with it off); not a speed change by itself.
+Then `particles` (the particle systems' update and their modifiers) with the queued node updates main runs after the
+frame is shown, proven the same way. Then `collision`: the Havok collision objects' part of the world-data
+update (the ragdoll bones' blend of node and body, a body moved to its node), proven the same way.
+Then `multibound`: the two passes main runs over the loaded world once a frame that keep the multibound culling
+current (each object's shape reset, then tested against the camera's frustum and the occluders), proven the same way.
+The `geometry` family (the code that reads and writes the geometry data's arrays, so a later step can keep them
+outside the 32-bit space; first the renderer's packing of them, the bound, the data's setters and the morpher, then
+their load, save and release, the tangent space and the pick), is in, off until its gate.
+Then `animation` (merged off on 2026-11-11, on after a batch gate): a skeleton's bones moved from their animation
+each frame, proven by its differential tests.
+And `draw_f`, merged off too: the small helpers the typed families call most (the larger and smaller of two numbers,
+the class test, a list node from the shared pool).
+The `anim_keys` family (the code that reads and writes an animation's key arrays, so a later step can keep them
+outside the 32-bit space; first the rotation keys' search, `Slerp` and their preparation) is in, off until its gate.
 
 An interim Windows preview (maintainer, 2026-11-06) can be built with `scripts/package-playtest.ps1`:
 a ZIP a player can run with no build, labelled a preview, wgpu remaining the big release. It has only

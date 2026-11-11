@@ -7,12 +7,17 @@
 //! resource the frame's unsent commands still use send those commands first. The caches keyed by
 //! state (pipelines, shader modules, samplers, bind groups) are where the speed work starts.
 
+use crate::answers::QueryAnswers;
+use crate::cache;
 use crate::format::{self, d3dfmt, Format};
+use crate::fxhash::Map;
+use crate::loading;
+use crate::prepare;
 use crate::shot::{self, Shots};
 use crate::sm::{self, wgsl, Stage};
 use crate::state::{self, rs, SamplerKey};
 use d3d9_stream::{Handle, Rect};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -65,6 +70,13 @@ pub(crate) struct Shader {
     program: sm::Program,
     sig: wgsl::Signature,
     id: u64,
+    /// The float constants its uniform block must carry ([`wgsl::float_constants_read`]).
+    fregs: u32,
+    /// Its inputs' varyings (a pixel shader's link to the vertex shader).
+    varyings: Vec<wgsl::Semantic>,
+    /// Its bytecode and the bytecode's hash, the same in every run ([`prepare::bytecode_hash`]).
+    tokens: Vec<u32>,
+    stable: u64,
 }
 
 /// A `D3DVERTEXELEMENT9`.
@@ -157,17 +169,75 @@ struct State {
     decl: Option<Arc<Decl>>,
     streams: [Stream; 16],
     indices: Option<Arc<Buf>>,
-    /// Shader constants as the model holds them: per stage float (4 words), int (4), bool (1).
-    vsf: Box<[[u32; 4]; 256]>,
+    /// Shader constants as the model holds them: per stage float (256 registers of 4 words, as
+    /// the register block carries them: little-endian bytes), int (4 words), bool (1).
+    vsf: Box<[u8; 4096]>,
     vsi: [[u32; 4]; 16],
     vsb: [u32; 16],
-    psf: Box<[[u32; 4]; 256]>,
+    psf: Box<[u8; 4096]>,
     psi: [[u32; 4]; 16],
     psb: [u32; 16],
     /// The user clip planes (`SetClipPlane`), float bits.
     clip: [[u32; 4]; wgsl::CLIP_PLANES],
-    /// The uniform blocks need writing again.
-    dirty: bool,
+    /// The vertex and pixel stage's uniform blocks need writing again.
+    dirty: [bool; 2],
+    /// ... and their headers, everything but the float constants, need making again
+    /// ([`Device::write_blocks`]): set with `dirty` by every change but a float constant's.
+    header_dirty: [bool; 2],
+    /// The handles the bindings were last set from ([`Bound`]).
+    bound: Bound,
+}
+
+/// A handle no binding holds: the object at a handle may have changed since it was bound
+/// ([`Bound::forget`]).
+const UNKNOWN: Handle = Handle::MAX;
+
+/// The handles `SetTexture`, `SetStreamSource` (with its offset and stride) and `SetIndices` last
+/// bound, so binding the same again changes nothing and looks nothing up (the game binds many again
+/// each draw). 0 is no object.
+#[derive(Clone, Default)]
+struct Bound {
+    textures: [Handle; 20],
+    streams: [(Handle, u32, u32); 16],
+    indices: Handle,
+    /// The vertex and pixel shader, the declaration.
+    shaders: [Handle; 2],
+    declaration: Handle,
+}
+
+impl Bound {
+    /// The object at `h` is gone or new: a binding of `h` looks it up again.
+    fn forget(&mut self, h: Handle) {
+        for t in &mut self.textures {
+            if *t == h {
+                *t = UNKNOWN;
+            }
+        }
+        for s in &mut self.streams {
+            if s.0 == h {
+                s.0 = UNKNOWN;
+            }
+        }
+        if self.indices == h {
+            self.indices = UNKNOWN;
+        }
+        for s in &mut self.shaders {
+            if *s == h {
+                *s = UNKNOWN;
+            }
+        }
+        if self.declaration == h {
+            self.declaration = UNKNOWN;
+        }
+    }
+}
+
+impl State {
+    /// Something a stage's block header carries changed (`stage` 0 vertex, 1 pixel).
+    fn touch(&mut self, stage: usize) {
+        self.dirty[stage] = true;
+        self.header_dirty[stage] = true;
+    }
 }
 
 /// What a render pass draws into.
@@ -191,13 +261,247 @@ struct PipeKey {
     depth: Option<wgpu::TextureFormat>,
     states: [u32; 30],
     samples: u32,
-    samplers: Vec<(u32, u8, bool)>,
+    /// Whether each of the shaders' samplers ([`Device::sampler_bindings`], in order) filters:
+    /// with the two shaders, what the bind group's layout is made from.
+    filterable: u32,
     /// NVIDIA's alpha to coverage in place of the alpha test ([`ATOC`]).
     atoc: bool,
     /// The pass has the occlusion count's target.
     count: bool,
     /// The user clip planes' code ([`Device::clip_link`]).
     clip: wgsl::Clip,
+}
+
+/// The samplers a draw's two shaders use ([`Device::sampler_bindings`]): (binding, dimension,
+/// filterable) and the device's sampler slot; at most 16 pixel and 4 vertex samplers.
+#[derive(Clone, Copy, Default)]
+struct Bindings {
+    n: usize,
+    b: [((u32, u8, bool), usize); 20],
+}
+
+impl Bindings {
+    fn as_slice(&self) -> &[((u32, u8, bool), usize)] {
+        &self.b[..self.n]
+    }
+}
+
+/// A bind group's key: each binding's number, the dimension its shader declares (2D, cube, volume:
+/// the layout the group is made for, and the dummy a texture of the other kind is replaced by), its
+/// texture and its sampler.
+type GroupKey = Vec<(u32, u8, u64, Option<SamplerKey>)>;
+
+/// A vertex shader's inputs read from a declaration ([`Device::vertex_link`]).
+struct VertexLink {
+    inputs: Vec<wgsl::Input>,
+    attributes: [Vec<wgpu::VertexAttribute>; 8],
+}
+
+/// What making pipelines cost since the last report (printed with the present counters every
+/// 600 presents): a pipeline made on first use holds the draw, and so the frame, until it is done.
+#[derive(Default)]
+struct Made {
+    pipelines: u32,
+    modules: u32,
+    convert: std::time::Duration,
+    module: std::time::Duration,
+    pipeline: std::time::Duration,
+    longest: std::time::Duration,
+    /// The pipelines' whole times (their modules included), and how many took over 16 ms.
+    whole: std::time::Duration,
+    over_16ms: u32,
+    /// The longest time between two presents on the device's thread (the render thread).
+    longest_frame: std::time::Duration,
+}
+
+impl Made {
+    fn add_module(&mut self, convert: std::time::Duration, module: std::time::Duration) {
+        self.modules += 1;
+        self.convert += convert;
+        self.module += module;
+    }
+    fn add_pipeline(&mut self, pipeline: std::time::Duration, all: std::time::Duration) {
+        self.pipelines += 1;
+        self.pipeline += pipeline;
+        self.longest = self.longest.max(all);
+        self.whole += all;
+        if all.as_millis() > 16 {
+            self.over_16ms += 1;
+        }
+    }
+}
+
+/// The list of pipelines to make before play and what of it is done ([`prepare`]).
+struct Listed {
+    list: prepare::List,
+    /// Entry by entry, the sample counts (as bits, as [`Device::sample_mask`]) it was made at or
+    /// tried and given up at (its shaders collide, a format is unknown); none yet: 0.
+    done: Vec<u32>,
+    /// The file and its lines, shared with the writer threads and the exit hooks.
+    shared: Arc<ListFile>,
+    /// Entries this run added that the file does not have yet, and the present of the last.
+    dirty: bool,
+    added_at: u64,
+    /// The present of the first entry the file does not have yet.
+    first_added_at: u64,
+}
+
+/// The list's file: its lines as the device has them, written on a thread of its own or by the
+/// exit hooks ([`save_lists_now`]).
+struct ListFile {
+    file: std::path::PathBuf,
+    lines: std::sync::Mutex<Vec<String>>,
+    /// How many lines the file has (none written yet: the count read).
+    written: std::sync::atomic::AtomicUsize,
+    writing: std::sync::Mutex<()>,
+    /// A write failed: none more this run (said once).
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl ListFile {
+    fn save(&self) {
+        if self.failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let _one = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        let text = {
+            let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+            if lines.len() == self.written.load(Ordering::Relaxed) {
+                return;
+            }
+            self.written.store(lines.len(), Ordering::Relaxed);
+            let mut t = String::new();
+            for l in lines.iter() {
+                t.push_str(l);
+                t.push('\n');
+            }
+            t
+        };
+        if let Err(e) = cache::write_replacing(&self.file, text.as_bytes()) {
+            self.failed.store(true, Ordering::Relaxed);
+            eprintln!(
+                "NV_D3D9 wgpu: pipeline list {}: not written: {e}: none written this run",
+                self.file.display()
+            );
+        }
+    }
+}
+
+/// The devices' list files, for [`save_lists_now`].
+static LISTS: std::sync::Mutex<Vec<std::sync::Weak<ListFile>>> = std::sync::Mutex::new(Vec::new());
+
+/// Writes every live device's pipeline list now, when it has new entries (the end of the run:
+/// the process ends with `std::process::exit`, so no device is dropped).
+pub fn save_lists_now() {
+    let all: Vec<Arc<ListFile>> = LISTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for l in all {
+        l.save();
+    }
+}
+
+/// The list shipped with the port (`data/pipelines.txt`), recorded on the maintainer's machine:
+/// four recordings of the game's Direct3D 9 calls (the intro and the main menu; Save 138's load
+/// and Doc Mitchell's house; the race menu; the Goodsprings street and a full turn there, at 4x
+/// antialiasing) replayed into this backend on Vulkan, each with an empty folder, their lists
+/// joined in that order, each entry once. It holds no game file's bytes: hashes of the game's
+/// shaders, format numbers and render-state values.
+const SHIPPED_LIST: &str = include_str!("../data/pipelines.txt");
+
+impl Listed {
+    fn load(dir: &std::path::Path) -> Listed {
+        cache::remove_stale_temporaries(dir, &["pipelines"]);
+        let file = dir.join("pipelines.txt");
+        let mut list = prepare::List::default();
+        let (shipped, s1) = list.merge(SHIPPED_LIST);
+        let (local, s2) = match std::fs::read_to_string(&file) {
+            Ok(text) => list.merge(&text),
+            Err(_) => (0, 0),
+        };
+        eprintln!(
+            "NV_D3D9 wgpu: pipeline list: {} entries ({shipped} shipped, {local} more from {}; {} lines not read)",
+            list.entries.len(),
+            file.display(),
+            s1 + s2
+        );
+        let lines: Vec<String> = list.entries.iter().map(prepare::Entry::line).collect();
+        let shared = Arc::new(ListFile {
+            file,
+            // Written when this run adds a line (the file then holds the shipped ones too).
+            written: std::sync::atomic::AtomicUsize::new(lines.len()),
+            lines: std::sync::Mutex::new(lines),
+            writing: std::sync::Mutex::new(()),
+            failed: Default::default(),
+        });
+        let mut all = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&shared));
+        Listed {
+            done: vec![0; list.entries.len()],
+            list,
+            shared,
+            dirty: false,
+            added_at: 0,
+            first_added_at: 0,
+        }
+    }
+
+    /// `e` listed (it was made on a draw at present `presents`), unless it is already.
+    fn add(&mut self, e: prepare::Entry, presents: u64) {
+        let line = e.line();
+        let samples = 1u32 << e.samples.min(31);
+        if self.list.add(e) {
+            self.done.push(samples);
+            if !self.dirty {
+                self.first_added_at = presents;
+            }
+            self.dirty = true;
+            self.added_at = presents;
+            self.shared
+                .lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line);
+        }
+    }
+
+    /// Writes the list 300 presents after the last new entry (or every 3600 while they keep
+    /// coming; at once with `now`), on a thread of its own.
+    fn save_if_due(&mut self, presents: u64, now: bool) {
+        if !self.dirty {
+            return;
+        }
+        let quiet = presents.saturating_sub(self.added_at) >= 300;
+        let long = presents.saturating_sub(self.first_added_at) >= 3600;
+        if !(now || quiet || long) {
+            return;
+        }
+        self.dirty = false;
+        let shared = self.shared.clone();
+        if now {
+            shared.save();
+        } else {
+            std::thread::spawn(move || shared.save());
+        }
+    }
+}
+
+/// What the open render pass was last given, so a draw sends only what changed.
+#[derive(Default)]
+struct PassBinds {
+    pipeline: Option<wgpu::RenderPipeline>,
+    blocks: Option<(u32, u32)>,
+    group: Option<wgpu::BindGroup>,
+    viewport: Option<[u32; 6]>,
+    scissor: Option<(u32, u32, u32, u32)>,
+    stencil: Option<u32>,
+    blend: Option<u32>,
+    streams: [Option<(wgpu::Buffer, u64)>; 8],
+    index: Option<(wgpu::Buffer, bool)>,
 }
 
 /// The render states a pipeline is made from.
@@ -285,19 +589,28 @@ const BLOCK: u64 = wgsl::REGS_SIZE.div_ceil(256) * 256;
 /// The ring of uniform blocks and `DrawPrimitiveUP` vertices sent with each batch.
 const RING: u64 = 32 << 20;
 const UP_RING: u64 = 8 << 20;
+/// The upload stage: buffer uploads into buffers the open batch draws from, copied in among the
+/// batch's commands ([`Device::upload_buffer`]).
+const STAGE: u64 = 8 << 20;
 
 pub struct Device {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     adapter: wgpu::Adapter,
     adapter_name: String,
-    surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
-    present_interval: u32,
-    objects: HashMap<Handle, Obj>,
+    /// The game's window and its swap chain ([`crate::window::Window`]), with [`Output::Window`].
+    surface: Option<crate::window::Window>,
+    objects: Map<Handle, Obj>,
     back_buffers: Vec<Handle>,
     auto_depth: Handle,
     st: State,
     encoder: Option<wgpu::CommandEncoder>,
+    /// The batch's earlier encoders, in order: finished on the finishing threads (or here), their
+    /// command buffers sent with the batch before the open encoder's ([`Device::send_encoder`]).
+    finishing: Vec<Finishing>,
+    finisher: Option<Finisher>,
+    /// Draws recorded into the open encoder.
+    encoder_draws: u32,
     pass: Option<wgpu::RenderPass<'static>>,
     pass_targets: Option<Targets>,
     batch: u64,
@@ -307,12 +620,46 @@ pub struct Device {
     uniform_layout: wgpu::BindGroupLayout,
     up: Vec<u8>,
     up_buffer: wgpu::Buffer,
+    stage: Vec<u8>,
+    stage_buffer: wgpu::Buffer,
     blocks: (u32, u32),
+    /// The float constants each stage's last written block carries.
+    block_fregs: [u32; 2],
     #[allow(clippy::type_complexity)]
-    sampler_layouts: HashMap<Vec<(u32, u8, bool)>, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
-    pipelines: HashMap<PipeKey, Option<wgpu::RenderPipeline>>,
+    sampler_layouts: Map<Vec<(u32, u8, bool)>, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
+    pipelines: Map<PipeKey, Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>>,
+    /// The last draw's pipeline key and pipeline, its bind group's key and group, its vertex
+    /// link; the vertex links by shader and declaration; what the open pass was given.
     #[allow(clippy::type_complexity)]
-    vs_modules: HashMap<
+    last_pipeline: Option<(
+        PipeKey,
+        Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    )>,
+    last_group: (GroupKey, Option<wgpu::BindGroup>),
+    last_link: Option<((u64, u64), Arc<VertexLink>)>,
+    vertex_links: Map<(u64, u64), Arc<VertexLink>>,
+    binds: PassBinds,
+    /// The driver's compiled pipelines kept between runs ([`cache`]), where the backend has them.
+    pipeline_cache: Option<cache::PipelineCacheFile>,
+    /// When the last `Present` began ([`Made::longest_frame`]).
+    last_present: Option<std::time::Instant>,
+    /// The screen of the backend's own long steps ([`Device::show_progress`]), made when first shown.
+    loading: Option<loading::Screen>,
+    /// The shaders by bytecode hash; the hashes two bytecodes share; the declarations by their
+    /// elements ([`Device::create_shader`], [`Device::decl_of`]).
+    shader_bytecode: Map<u64, Vec<Arc<Shader>>>,
+    collided: HashSet<u64>,
+    decls_by_elements: Map<Vec<Element>, Arc<Decl>>,
+    /// The pipelines to make before play ([`prepare`]): the list, which of its entries are made
+    /// (or tried), whether a new shader or sample count may have made more of them ready, the
+    /// local list's file and whether it has entries it has not written. None without a cache folder.
+    list: Option<Listed>,
+    /// The sample counts of the surfaces made so far, as bits (1 always).
+    sample_mask: u32,
+    listed_new: bool,
+    made: Made,
+    #[allow(clippy::type_complexity)]
+    vs_modules: Map<
         (
             u64,
             Vec<wgsl::Input>,
@@ -323,18 +670,18 @@ pub struct Device {
         Option<wgpu::ShaderModule>,
     >,
     #[allow(clippy::type_complexity)]
-    ps_modules: HashMap<(u64, Vec<wgsl::Semantic>, bool, wgsl::Clip), Option<wgpu::ShaderModule>>,
-    samplers: HashMap<SamplerKey, wgpu::Sampler>,
-    groups: HashMap<Vec<(u32, u64, Option<SamplerKey>)>, wgpu::BindGroup>,
-    blit: HashMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
+    ps_modules: Map<(u64, Vec<wgsl::Semantic>, bool, wgsl::Clip), Option<wgpu::ShaderModule>>,
+    samplers: Map<SamplerKey, wgpu::Sampler>,
+    groups: Map<GroupKey, wgpu::BindGroup>,
+    blit: Map<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
     blit_layout: Option<wgpu::BindGroupLayout>,
     #[allow(clippy::type_complexity)]
     gamma_resolves:
-        HashMap<(wgpu::TextureFormat, u32, bool), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+        Map<(wgpu::TextureFormat, u32, bool), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// Depth stand-ins for targets smaller than the bound depth surface ([`Device::usable_depth`]).
-    depth_parts: HashMap<(u64, u32, u32), Arc<Surf>>,
+    depth_parts: Map<(u64, u32, u32), Arc<Surf>>,
     #[allow(clippy::type_complexity)]
-    clears: HashMap<
+    clears: Map<
         (
             [Option<(wgpu::TextureFormat, bool)>; 4],
             Option<wgpu::TextureFormat>,
@@ -349,18 +696,29 @@ pub struct Device {
     clip_distances: bool,
     /// The pixel-centre move the last written vertex block carries ([`Device::write_blocks`]).
     block_centre: [f32; 2],
+    /// Each stage's block header as last made, and the pixel-centre move and alpha to coverage
+    /// switch they were made with ([`Device::write_blocks`]).
+    headers: [[u8; HEADER]; 2],
+    header_centre: [f32; 2],
+    header_atoc: bool,
     /// The levels whose bytes the backend keeps (managed and system-memory pools: what
     /// `ReadSurface` answers), by the texture or surface they belong to; and those bytes, as the
     /// game last gave them (`UploadSurface`) or `GetRenderTargetData` wrote them.
-    keeps: HashMap<Handle, Vec<Handle>>,
-    kept: HashMap<Handle, Vec<u8>>,
+    keeps: Map<Handle, Vec<Handle>>,
+    kept: Map<Handle, Vec<u8>>,
     /// The occlusion query counting now (its `D3DISSUE_BEGIN` until its `END`) and its slot.
     counting: Option<(Handle, u32)>,
     pass_count: Option<CountSegment>,
-    count_targets: HashMap<(u32, u32, u32), wgpu::TextureView>,
+    count_targets: Map<(u32, u32, u32), wgpu::TextureView>,
     count_buffer: wgpu::Buffer,
     next_count_slot: u32,
-    reduce: HashMap<bool, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    reduce: Map<bool, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// The copies of textures a draw samples while drawing into them, by the texture's id
+    /// ([`Device::copy_for_sampling`]).
+    target_copies: Map<u64, Arc<Tex>>,
+    /// Textures and surfaces destroyed since the last `Present`, by id: the cached bind groups and
+    /// depth stand-ins that hold them are dropped then ([`Device::purge_destroyed`]).
+    destroyed: HashSet<u64>,
     next_id: u64,
     presents: u64,
     shots: Option<Shots>,
@@ -368,9 +726,15 @@ pub struct Device {
     errors: Arc<AtomicU64>,
     pub(crate) draws: u64,
     pub(crate) skipped: u64,
+    /// Pipelines made on the draw that needed them (not ahead from the list).
+    made_on_draws: u64,
+    /// Where the occlusion counts are posted for the game's threads ([`QueryAnswers`]), and the
+    /// `END`s (query, number) whose counts are awaited.
+    pub(crate) answers: Option<Arc<QueryAnswers>>,
+    awaiting: Vec<(Handle, u64)>,
 }
 
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     // wgpu's native futures are ready when polled after the work they wait for (a `poll`).
     struct Noop;
     impl std::task::Wake for Noop {
@@ -411,8 +775,6 @@ impl PresentParameters {
     }
 }
 
-/// `D3DPRESENT_INTERVAL_IMMEDIATE`.
-const INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 /// `D3DPOOL_MANAGED`, `D3DPOOL_SYSTEMMEM`, `D3DPOOL_SCRATCH`.
 const POOL_MANAGED: u32 = 1;
 const POOL_SYSTEMMEM: u32 = 2;
@@ -435,22 +797,12 @@ impl Device {
         pp: &PresentParameters,
         back_buffers: &[Handle],
         depth: Handle,
+        cache_dir: Option<&std::path::Path>,
     ) -> Result<Device, String> {
-        // `NV_WGPU_BACKEND` names one; by default Direct3D 12 on Windows (measured closest to the
-        // real Direct3D 9 on the same driver: Doc's house differs in 0.3% of pixels against 6% on
-        // Vulkan, DESIGN.md), then whatever the platform has.
-        // `software`: the platform's software adapter (WARP on Windows, the one CI's runners
-        // have), for checking that the backend does not depend on one card's leniency.
-        let backend = std::env::var("NV_WGPU_BACKEND");
-        let software = backend.as_deref() == Ok("software");
-        let tries: Vec<wgpu::Backends> = match backend.as_deref() {
-            Ok("dx12") => vec![wgpu::Backends::DX12],
-            Ok("vulkan") => vec![wgpu::Backends::VULKAN],
-            Ok("gl") => vec![wgpu::Backends::GL],
-            Ok("metal") => vec![wgpu::Backends::METAL],
-            _ if cfg!(windows) => vec![wgpu::Backends::DX12, wgpu::Backends::PRIMARY],
-            _ => vec![wgpu::Backends::PRIMARY],
-        };
+        // The graphics APIs in [`apis`]'s order: Vulkan, then Direct3D 12 for a card without a
+        // Vulkan driver; `NV_WGPU_BACKEND` names one.
+        let asked = std::env::var("NV_WGPU_BACKEND").ok();
+        let (tries, software) = apis(asked.as_deref());
         let mut found = None;
         for backends in tries {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -463,22 +815,34 @@ impl Device {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
             let surface = match output {
-                Output::Window if window != 0 => Some(surface_for(&instance, window)?),
+                Output::Window if window != 0 => match surface_for(&instance, window) {
+                    Ok(s) => Some(s),
+                    // The window on this API failed: the next API is tried.
+                    Err(e) => {
+                        eprintln!("NV_D3D9 wgpu: {backends:?}: {e}");
+                        continue;
+                    }
+                },
                 _ => None,
             };
-            let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            let Ok(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: software,
                 compatible_surface: surface.as_ref(),
                 apply_limit_buckets: false,
-            }))
-            .ok();
-            if let Some(adapter) = adapter {
-                found = Some((surface, adapter));
+            })) else {
+                continue;
+            };
+            // A graphics card ends the search. A software adapter (a CPU one) stands only until a
+            // later API has a card, or is asked for: with none, the last API's (WARP, Direct3D
+            // 12's, on Windows, as CI's runners had before Vulkan came first).
+            let cpu = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+            found = Some((instance, surface, adapter));
+            if !cpu || software {
                 break;
             }
         }
-        let (surface, adapter) = found.ok_or("no wgpu adapter")?;
+        let (instance, surface, adapter) = found.ok_or("no wgpu adapter")?;
         let wanted = wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::FLOAT32_FILTERABLE
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
@@ -486,7 +850,8 @@ impl Device {
             | wgpu::Features::DEPTH32FLOAT_STENCIL8
             | wgpu::Features::CLIP_DISTANCES
             | wgpu::Features::FLOAT32_BLENDABLE
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            | wgpu::Features::PIPELINE_CACHE;
         let features = adapter.features() & wanted;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("d3d9-wgpu"),
@@ -497,6 +862,11 @@ impl Device {
             trace: Default::default(),
         }))
         .map_err(|e| format!("request_device: {e}"))?;
+        // The driver's compiled pipelines from the last run, where the backend keeps them (Vulkan).
+        let pipeline_cache =
+            cache_dir.and_then(|d| cache::PipelineCacheFile::open(&device, &adapter.get_info(), d));
+        // The pipelines to make before play: the shipped list and this machine's.
+        let list = cache_dir.map(Listed::load);
         let errors = Arc::new(AtomicU64::new(0));
         {
             let errors = errors.clone();
@@ -539,6 +909,12 @@ impl Device {
                 }),
             }),
         });
+        let stage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upload stage"),
+            size: STAGE,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let up_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DrawPrimitiveUP vertices"),
             size: UP_RING,
@@ -560,8 +936,7 @@ impl Device {
             adapter: adapter.clone(),
             adapter_name,
             surface: None,
-            present_interval: pp.interval,
-            objects: HashMap::new(),
+            objects: Map::default(),
             back_buffers: Vec::new(),
             auto_depth: 0,
             st: State {
@@ -577,16 +952,21 @@ impl Device {
                 decl: None,
                 streams: Default::default(),
                 indices: None,
-                vsf: Box::new([[0; 4]; 256]),
+                vsf: Box::new([0; 4096]),
                 vsi: [[0; 4]; 16],
                 vsb: [0; 16],
-                psf: Box::new([[0; 4]; 256]),
+                psf: Box::new([0; 4096]),
                 psi: [[0; 4]; 16],
                 psb: [0; 16],
                 clip: [[0; 4]; wgsl::CLIP_PLANES],
-                dirty: true,
+                dirty: [true; 2],
+                header_dirty: [true; 2],
+                bound: Bound::default(),
             },
             encoder: None,
+            finishing: Vec::new(),
+            finisher: Finisher::for_this_machine(),
+            encoder_draws: 0,
             pass: None,
             pass_targets: None,
             batch: 1,
@@ -596,31 +976,55 @@ impl Device {
             uniform_layout,
             up: Vec::new(),
             up_buffer,
+            stage: Vec::new(),
+            stage_buffer,
             blocks: (0, 0),
-            sampler_layouts: HashMap::new(),
-            pipelines: HashMap::new(),
-            vs_modules: HashMap::new(),
-            ps_modules: HashMap::new(),
-            samplers: HashMap::new(),
-            groups: HashMap::new(),
-            blit: HashMap::new(),
+            block_fregs: [0; 2],
+            sampler_layouts: Map::default(),
+            pipelines: Map::default(),
+            last_pipeline: None,
+            last_group: (Vec::new(), None),
+            last_link: None,
+            vertex_links: Map::default(),
+            binds: PassBinds::default(),
+            made_on_draws: 0,
+            pipeline_cache,
+            last_present: None,
+            loading: None,
+            shader_bytecode: Map::default(),
+            collided: HashSet::new(),
+            decls_by_elements: Map::default(),
+            list,
+            sample_mask: 1 << 1,
+            listed_new: false,
+            made: Made::default(),
+            vs_modules: Map::default(),
+            ps_modules: Map::default(),
+            samplers: Map::default(),
+            groups: Map::default(),
+            blit: Map::default(),
             blit_layout: None,
-            gamma_resolves: HashMap::new(),
-            depth_parts: HashMap::new(),
-            clears: HashMap::new(),
+            gamma_resolves: Map::default(),
+            depth_parts: Map::default(),
+            clears: Map::default(),
             dummy,
             border: features.contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER),
             float_filterable: features.contains(wgpu::Features::FLOAT32_FILTERABLE),
             clip_distances: features.contains(wgpu::Features::CLIP_DISTANCES),
             block_centre: [0.0; 2],
-            keeps: HashMap::new(),
-            kept: HashMap::new(),
+            headers: [[0; HEADER]; 2],
+            header_centre: [0.0; 2],
+            header_atoc: false,
+            keeps: Map::default(),
+            kept: Map::default(),
             counting: None,
             pass_count: None,
-            count_targets: HashMap::new(),
+            count_targets: Map::default(),
             count_buffer,
             next_count_slot: 0,
-            reduce: HashMap::new(),
+            reduce: Map::default(),
+            target_copies: Map::default(),
+            destroyed: HashSet::new(),
             next_id: 1,
             presents: 0,
             shots: Shots::from_env(),
@@ -628,62 +1032,37 @@ impl Device {
             errors,
             draws: 0,
             skipped: 0,
+            answers: None,
+            awaiting: Vec::new(),
         };
         if let Some(surface) = surface {
-            let caps = surface.get_capabilities(&adapter);
-            let format = caps
-                .formats
-                .iter()
-                .copied()
-                .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
-                .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
-                .unwrap_or(caps.formats[0]);
-            // Copies out too, with `NV_SHOT` only and where the surface allows them: the shots
-            // read the window's frame.
-            let copies = if d.shots.is_some() {
-                caps.usages & wgpu::TextureUsages::COPY_SRC
-            } else {
-                wgpu::TextureUsages::empty()
-            };
-            let config = wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | copies,
-                format,
-                width: pp.width.max(1),
-                height: pp.height.max(1),
-                present_mode: d.present_mode(&caps),
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                desired_maximum_frame_latency: 2,
-                alpha_mode: caps.alpha_modes[0],
-                view_formats: vec![],
-            };
-            surface.configure(&d.device, &config);
-            d.surface = Some((surface, config));
+            // The swap chain at the window's size ([`crate::window`]); with `NV_SHOT` its frames
+            // can be copied out too (`wgpu-window-N.bmp`).
+            d.surface = Some(crate::window::Window::new(
+                window,
+                instance,
+                adapter.clone(),
+                surface,
+                &d.device,
+                (pp.width, pp.height),
+                pp.interval,
+                d.shots.is_some(),
+            ));
         }
         d.make_back_buffers(pp, back_buffers, depth);
+        let shown = match (&d.surface, output) {
+            (Some(w), _) => format!(
+                "on the game's window: {}x{}, {:?}",
+                w.config.width, w.config.height, w.config.present_mode
+            ),
+            (None, Output::Window) => "with no window".to_string(),
+            (None, Output::Offscreen) => "offscreen".to_string(),
+        };
         eprintln!(
-            "NV_D3D9 wgpu: the game's device on {} ({}x{}, format {}, {})",
-            d.adapter_name,
-            pp.width,
-            pp.height,
-            pp.format,
-            match output {
-                Output::Window => "on the game's window",
-                Output::Offscreen => "offscreen",
-            }
+            "NV_D3D9 wgpu: the game's device on {} ({}x{}, format {}, {shown})",
+            d.adapter_name, pp.width, pp.height, pp.format,
         );
         Ok(d)
-    }
-
-    fn present_mode(&self, caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-        let immediate = self.present_interval == INTERVAL_IMMEDIATE
-            || std::env::var("NV_D3D9_PRESENT").is_ok_and(|v| v.eq_ignore_ascii_case("immediate"));
-        if immediate && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else if immediate {
-            wgpu::PresentMode::AutoNoVsync
-        } else {
-            wgpu::PresentMode::Fifo
-        }
     }
 
     fn id(&mut self) -> u64 {
@@ -773,6 +1152,12 @@ impl Device {
                 "a {width}x{height} block-compressed texture: wgpu wants whole blocks (skipped)"
             ));
             return None;
+        }
+        // A new sample count may make more listed pipelines ready ([`Device::prepare_listed`]).
+        let bit = 1u32 << samples.min(31);
+        if self.sample_mask & bit == 0 {
+            self.sample_mask |= bit;
+            self.listed_new = true;
         }
         let layers = if cube { 6 } else { 1 };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -912,6 +1297,7 @@ impl Device {
         pool: u32,
     ) {
         self.keep_levels(texture, levels, pool);
+        self.st.bound.forget(texture);
         let count = if cube {
             levels.len() as u32 / 6
         } else {
@@ -980,6 +1366,7 @@ impl Device {
     }
 
     pub(crate) fn create_buffer(&mut self, buffer: Handle, index: bool, length: u32, format: u32) {
+        self.st.bound.forget(buffer);
         let size = u64::from(length.max(4).div_ceil(4) * 4);
         let wgpu_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -1001,18 +1388,50 @@ impl Device {
     }
 
     pub(crate) fn create_shader(&mut self, shader: Handle, tokens: &[u32]) {
+        self.st.bound.forget(shader);
+        // One shader object for one bytecode: a shader made again (another handle, the same
+        // tokens) shares its modules and pipelines, and the list ([`prepare`]) finds it by hash.
+        let stable = prepare::bytecode_hash(tokens);
+        if let Some(same) = self.shader_bytecode.get(&stable) {
+            if let Some(s) = same.iter().find(|s| s.tokens[..] == tokens[..]) {
+                let s = s.clone();
+                self.objects.insert(shader, Obj::Shader(s));
+                return;
+            }
+            // Two bytecodes, one hash: the list's entries with it are never prepared (a
+            // draw still finds its own pipeline by the exact key).
+            if self.collided.insert(stable) {
+                eprintln!("NV_D3D9 wgpu: two shaders share the bytecode hash {stable:016x}: its listed pipelines are not prepared");
+            }
+        }
         match sm::parse(tokens) {
             Ok(program) => {
                 let sig = wgsl::signature(&program);
                 let id = self.id();
-                self.objects
-                    .insert(shader, Obj::Shader(Arc::new(Shader { program, sig, id })));
+                let fregs = wgsl::float_constants_read(&program);
+                let varyings = sig.inputs.iter().map(|(_, s)| *s).collect();
+                let s = Arc::new(Shader {
+                    program,
+                    sig,
+                    id,
+                    fregs,
+                    varyings,
+                    tokens: tokens.to_vec(),
+                    stable,
+                });
+                self.shader_bytecode
+                    .entry(stable)
+                    .or_default()
+                    .push(s.clone());
+                self.objects.insert(shader, Obj::Shader(s));
+                self.listed_new = true;
             }
             Err(e) => self.warn(format!("a shader the converter cannot read: {e}")),
         }
     }
 
     pub(crate) fn create_declaration(&mut self, declaration: Handle, bytes: &[u8]) {
+        self.st.bound.forget(declaration);
         let mut elements = Vec::new();
         for e in bytes.chunks_exact(8) {
             if e[0] == 0xFF || e[4] == 17 {
@@ -1026,9 +1445,23 @@ impl Device {
                 index: e[7],
             });
         }
+        let d = self.decl_of(elements);
+        self.objects.insert(declaration, Obj::Decl(d));
+    }
+
+    /// One declaration object for one list of elements, whether the game made it (again) or the
+    /// list ([`prepare`]) names it.
+    fn decl_of(&mut self, elements: Vec<Element>) -> Arc<Decl> {
+        if let Some(d) = self.decls_by_elements.get(&elements) {
+            return d.clone();
+        }
         let id = self.id();
-        self.objects
-            .insert(declaration, Obj::Decl(Arc::new(Decl { elements, id })));
+        let d = Arc::new(Decl {
+            elements: elements.clone(),
+            id,
+        });
+        self.decls_by_elements.insert(elements, d.clone());
+        d
     }
 
     pub(crate) fn create_query(&mut self, query: Handle, kind: u32) {
@@ -1039,9 +1472,13 @@ impl Device {
                 ..Query::default()
             }),
         );
+        if let Some(a) = &self.answers {
+            a.made(query, kind == QUERY_OCCLUSION);
+        }
     }
 
     pub(crate) fn destroy(&mut self, object: Handle) {
+        self.st.bound.forget(object);
         if let Some(levels) = self.keeps.remove(&object) {
             for h in levels {
                 self.kept.remove(&h);
@@ -1051,11 +1488,44 @@ impl Device {
             self.end_pass();
             self.counting = None;
         }
-        if let Some(Obj::Texture(_, surfaces)) = self.objects.remove(&object) {
-            for s in surfaces {
-                self.objects.remove(&s);
+        match self.objects.remove(&object) {
+            Some(Obj::Texture(t, surfaces)) => {
+                if let Some(c) = self.target_copies.remove(&t.id) {
+                    self.destroyed.insert(c.id);
+                }
+                self.destroyed.insert(t.id);
+                for s in surfaces {
+                    self.objects.remove(&s);
+                }
             }
+            Some(Obj::Surface(s)) => {
+                self.destroyed.insert(s.id);
+            }
+            _ => {}
         }
+    }
+
+    /// The cached bind groups that sample a texture destroyed since the last `Present`, and the depth
+    /// stand-ins made for a destroyed depth surface, dropped: they held the texture (its video
+    /// memory) until the cache filled up (8,192 groups), so over a long walk the textures of
+    /// unloaded cells stayed. Once a frame, so a cell change that destroys hundreds of textures
+    /// costs one pass over the cache.
+    fn purge_destroyed(&mut self) {
+        if self.destroyed.is_empty() {
+            return;
+        }
+        let gone = std::mem::take(&mut self.destroyed);
+        let holds = |k: &GroupKey| k.iter().any(|e| gone.contains(&e.2));
+        self.groups.retain(|k, _| !holds(k));
+        if holds(&self.last_group.0) {
+            self.last_group = (Vec::new(), None);
+        }
+        self.depth_parts.retain(|k, _| !gone.contains(&k.0));
+    }
+
+    /// How many bind groups are cached (tests).
+    pub fn cached_bind_groups(&self) -> usize {
+        self.groups.len()
     }
 
     /// Sends the frame's commands so far, so a later upload cannot change what they draw.
@@ -1069,11 +1539,33 @@ impl Device {
             self.queue.write_buffer(&self.up_buffer, 0, &self.up);
             self.up.clear();
         }
-        if let Some(e) = self.encoder.take() {
-            self.queue.submit([e.finish()]);
+        if !self.stage.is_empty() {
+            self.queue.write_buffer(&self.stage_buffer, 0, &self.stage);
+            self.stage.clear();
         }
+        // The batch's encoders in order: the earlier ones as their finishing threads finish them,
+        // the open one finished here.
+        let mut buffers: Vec<wgpu::CommandBuffer> = self
+            .finishing
+            .drain(..)
+            .map(|f| match f {
+                Finishing::Ready(b) => b,
+                Finishing::Pending(r) => match r.recv() {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(why)) => panic!("a finishing thread could not finish an encoder: {why}"),
+                    Err(_) => panic!("a finishing thread stopped before it finished an encoder"),
+                },
+            })
+            .collect();
+        if let Some(e) = self.encoder.take() {
+            buffers.push(e.finish());
+        }
+        if !buffers.is_empty() {
+            self.queue.submit(buffers);
+        }
+        self.encoder_draws = 0;
         self.batch += 1;
-        self.st.dirty = true;
+        self.st.dirty = [true; 2];
     }
 
     pub(crate) fn upload_surface(&mut self, surface: Handle, data: &[u8]) {
@@ -1151,13 +1643,39 @@ impl Device {
         }
         data.copy_to(0, &mut shadow[offset as usize..offset as usize + len]);
         let start = (offset as usize) & !3;
-        let end = (offset as usize + len).div_ceil(4) * 4;
-        let end = end.min(shadow.len());
-        let bytes = shadow[start..end].to_vec();
-        if b.batch.load(Ordering::Relaxed) == self.batch {
+        let end = ((offset as usize + len).div_ceil(4) * 4).min(shadow.len());
+        let in_batch = b.batch.load(Ordering::Relaxed) == self.batch;
+        if in_batch && self.stage.len() + (end - start) <= STAGE as usize {
+            // The open batch draws from this buffer already: the new bytes go in between, as a
+            // copy among the batch's commands from its upload stage (written before the batch
+            // runs, as the register ring is), so the draws before read the old bytes and the draws
+            // after the new, and the batch is not sent for it (it was: five times a frame in the
+            // crowded street, each a submit and a new encoder).
+            // The pass ends first (a copy cannot be recorded inside one), then the bytes are staged.
+            self.end_pass();
+            let Some(Obj::Buffer(_, shadow)) = self.objects.get(&buffer) else {
+                return;
+            };
+            let at = self.stage.len() as u64;
+            self.stage.extend_from_slice(&shadow[start..end]);
+            let stage = self.stage_buffer.clone();
+            self.encoder().copy_buffer_to_buffer(
+                &stage,
+                at,
+                &b.buffer,
+                start as u64,
+                (end - start) as u64,
+            );
+            return;
+        }
+        if in_batch {
             self.flush();
         }
-        self.queue.write_buffer(&b.buffer, start as u64, &bytes);
+        // Not drawn from by the open batch: written before the batch's commands run.
+        if let Some(Obj::Buffer(_, shadow)) = self.objects.get(&buffer) {
+            self.queue
+                .write_buffer(&b.buffer, start as u64, &shadow[start..end]);
+        }
     }
 
     // State.
@@ -1185,20 +1703,38 @@ impl Device {
                 self.st.scissor = [0, 0, s.width as i32, s.height as i32];
             }
         }
+        // The same target again (the viewport and scissor reset above, as Direct3D 9 does) changes
+        // nothing a block carries; another may change the samples, and with them the alpha to
+        // coverage switch ([`ATOC`]).
+        let same = |a: &Option<Arc<Surf>>, b: &Option<Arc<Surf>>| match (a, b) {
+            (Some(a), Some(b)) => a.id == b.id,
+            (None, None) => true,
+            _ => false,
+        };
+        if self.st.rt.get(index as usize).is_some_and(|r| same(r, &s)) {
+            return;
+        }
         if let Some(slot) = self.st.rt.get_mut(index as usize) {
             *slot = s;
         }
-        self.st.dirty = true;
+        self.st.touch(0);
+        self.st.touch(1);
     }
 
     pub(crate) fn set_depth_stencil(&mut self, surface: Handle) {
-        self.st.ds = if surface == 0 {
+        let ds = if surface == 0 {
             None
         } else {
             self.surface_of(surface)
         };
+        // The same depth surface again changes nothing a block carries.
+        if ds.as_ref().map(|d| d.id) == self.st.ds.as_ref().map(|d| d.id) {
+            return;
+        }
+        self.st.ds = ds;
         // The targets' sample count decides the alpha to coverage switch ([`ATOC`]).
-        self.st.dirty = true;
+        self.st.touch(0);
+        self.st.touch(1);
     }
 
     /// `SetClipPlane(index, plane)`: in clip space, as Direct3D 9 takes them with a vertex
@@ -1206,7 +1742,7 @@ impl Device {
     pub(crate) fn set_clip_plane(&mut self, index: u32, plane: [u32; 4]) {
         if let Some(p) = self.st.clip.get_mut(index as usize) {
             *p = plane;
-            self.st.dirty = true;
+            self.st.touch(0);
         }
     }
 
@@ -1219,7 +1755,8 @@ impl Device {
             min_z: f32::from_bits(v[4]),
             max_z: f32::from_bits(v[5]),
         };
-        self.st.dirty = true;
+        // Nothing to mark: the vertex block carries the viewport's pixel-centre move, which
+        // [`Device::write_blocks`] compares at each draw.
     }
 
     pub(crate) fn set_scissor(&mut self, r: Rect) {
@@ -1227,16 +1764,20 @@ impl Device {
     }
 
     pub(crate) fn set_render_state(&mut self, state: u32, value: u32) {
-        if let Some(s) = self.st.rs.get_mut(state as usize) {
-            *s = value;
+        // A state set to the value it has changes nothing (the game sets many again each draw).
+        let Some(s) = self.st.rs.get_mut(state as usize) else {
+            return;
+        };
+        if *s == value {
+            return;
         }
+        *s = value;
         match state as usize {
-            rs::ALPHATESTENABLE
-            | rs::ALPHAREF
-            | rs::ALPHAFUNC
-            | rs::CLIPPLANEENABLE
-            | RS_CLIPPING
-            | RS_ADAPTIVETESS_Y => self.st.dirty = true,
+            // The pixel block's alpha test and alpha to coverage; the vertex block's clip planes.
+            rs::ALPHATESTENABLE | rs::ALPHAREF | rs::ALPHAFUNC | RS_ADAPTIVETESS_Y => {
+                self.st.touch(1)
+            }
+            rs::CLIPPLANEENABLE | RS_CLIPPING => self.st.touch(0),
             rs::FOGENABLE if value != 0 => {
                 self.warn("D3DRS_FOGENABLE (fixed-function fog) is not provided")
             }
@@ -1258,10 +1799,18 @@ impl Device {
 
     pub(crate) fn set_sampler_state(&mut self, sampler: u32, kind: u32, value: u32) {
         if let Some(slot) = Self::sampler_slot(sampler) {
-            if let Some(s) = self.st.samplers[slot].get_mut(kind as usize) {
-                *s = value;
+            let Some(s) = self.st.samplers[slot].get_mut(kind as usize) else {
+                return;
+            };
+            if *s == value {
+                return;
             }
-            self.st.dirty = true;
+            *s = value;
+            // Of the sampler states only the LOD bias is in the stage's block; the rest go into
+            // the draw's sampler, made from them at the draw.
+            if kind as usize == state::ss::MIPMAPLODBIAS {
+                self.st.touch(usize::from(slot < 16));
+            }
             if kind as usize == state::ss::SRGBTEXTURE && value != 0 {
                 self.warn("D3DSAMP_SRGBTEXTURE is not provided yet");
             }
@@ -1270,16 +1819,32 @@ impl Device {
 
     pub(crate) fn set_texture(&mut self, sampler: u32, texture: Handle) {
         if let Some(slot) = Self::sampler_slot(sampler) {
-            self.st.textures[slot] = if texture == 0 {
+            // The texture bound there already (the game binds many again each draw): nothing
+            // to look up ([`State::bound`]).
+            if self.st.bound.textures[slot] == texture {
+                return;
+            }
+            let t = if texture == 0 {
                 None
             } else {
                 self.texture_of(texture)
             };
-            self.st.dirty = true;
+            // The stage's block carries each sampler's fill mode (its texture's format).
+            let fix = |t: &Option<Arc<Tex>>| t.as_ref().map_or(0, |t| t.format.fix);
+            if fix(&t) != fix(&self.st.textures[slot]) {
+                self.st.touch(usize::from(slot < 16));
+            }
+            self.st.textures[slot] = t;
+            self.st.bound.textures[slot] = texture;
         }
     }
 
     pub(crate) fn set_shader(&mut self, pixel: bool, shader: Handle) {
+        // The shader bound there already: nothing to look up ([`State::bound`]).
+        if self.st.bound.shaders[usize::from(pixel)] == shader {
+            return;
+        }
+        self.st.bound.shaders[usize::from(pixel)] = shader;
         let s = match self.objects.get(&shader) {
             Some(Obj::Shader(s)) => Some(s.clone()),
             _ => None,
@@ -1292,24 +1857,42 @@ impl Device {
     }
 
     pub(crate) fn set_declaration(&mut self, declaration: Handle) {
+        if self.st.bound.declaration == declaration {
+            return;
+        }
+        self.st.bound.declaration = declaration;
         self.st.decl = match self.objects.get(&declaration) {
             Some(Obj::Decl(d)) => Some(d.clone()),
             _ => None,
         };
     }
 
-    pub(crate) fn set_constants(&mut self, kind: u8, start: u32, count: u32, words: &[u32]) {
+    /// `Set*ShaderConstant*` (`kind`: vertex float, int, bool, then the same for the pixel stage)
+    /// of `count` registers from `start`, from the command's bytes. Float registers are copied
+    /// as bytes (a draw's block carries them so); registers past the file's end are not kept.
+    pub(crate) fn set_constants(
+        &mut self,
+        kind: u8,
+        start: u32,
+        count: u32,
+        data: &d3d9_stream::Data<'_>,
+    ) {
         let st = &mut self.st;
         let s = start as usize;
-        match kind {
-            0 | 3 => {
-                let regs = if kind == 0 { &mut st.vsf } else { &mut st.psf };
-                for (k, r) in words.chunks_exact(4).take(count as usize).enumerate() {
-                    if let Some(slot) = regs.get_mut(s + k) {
-                        slot.copy_from_slice(r);
-                    }
-                }
+        let stage = usize::from(kind >= 3);
+        if kind == 0 || kind == 3 {
+            let regs = if kind == 0 { &mut st.vsf } else { &mut st.psf };
+            let n = (count as usize)
+                .min(data.len() as usize / 16)
+                .min(256usize.saturating_sub(s));
+            if n > 0 {
+                data.copy_to(0, &mut regs[16 * s..16 * (s + n)]);
             }
+            st.dirty[stage] = true;
+            return;
+        }
+        let words = data.to_words();
+        match kind {
             1 | 4 => {
                 let regs = if kind == 1 { &mut st.vsi } else { &mut st.psi };
                 for (k, r) in words.chunks_exact(4).take(count as usize).enumerate() {
@@ -1327,10 +1910,17 @@ impl Device {
                 }
             }
         }
-        st.dirty = true;
+        st.touch(stage);
     }
 
     pub(crate) fn set_stream(&mut self, stream: u32, buffer: Handle, offset: u32, stride: u32) {
+        let Some(&(h, o, s)) = self.st.bound.streams.get(stream as usize) else {
+            return;
+        };
+        if (h, o, s) == (buffer, offset, stride) {
+            return;
+        }
+        self.st.bound.streams[stream as usize] = (buffer, offset, stride);
         let b = if buffer == 0 {
             None
         } else {
@@ -1346,6 +1936,10 @@ impl Device {
     }
 
     pub(crate) fn set_indices(&mut self, buffer: Handle) {
+        if self.st.bound.indices == buffer {
+            return;
+        }
+        self.st.bound.indices = buffer;
         self.st.indices = if buffer == 0 {
             None
         } else {
@@ -1362,12 +1956,84 @@ impl Device {
         })
     }
 
+    /// The open encoder (its pass ended) to a finishing thread, its command buffer sent with the
+    /// batch after the encoders before it ([`Device::flush`]).
+    fn send_encoder(&mut self) {
+        self.end_pass();
+        if let Some(e) = self.encoder.take() {
+            self.finishing.push(match &self.finisher {
+                Some(f) => f.send(e),
+                None => Finishing::Ready(e.finish()),
+            });
+        }
+        self.encoder_draws = 0;
+    }
+
     fn end_pass(&mut self) {
         self.pass = None;
         self.pass_targets = None;
         if let Some(c) = self.pass_count.take() {
             self.reduce_count(&c);
         }
+    }
+
+    /// Whether a level or a face of `t` is one of the current colour targets.
+    fn is_colour_target(&self, t: &Tex) -> bool {
+        self.st
+            .rt
+            .iter()
+            .flatten()
+            .any(|s| s.tex.as_ref().is_some_and(|rt| rt.id == t.id))
+    }
+
+    /// A copy of `t` (every level and face) as it is now, for a draw that samples `t` while it
+    /// draws into it: the open pass ends, so the copy holds every draw before this one, and the
+    /// next pass loads the targets again. One scratch texture is kept for each such texture.
+    fn copy_for_sampling(&mut self, t: &Arc<Tex>) -> Option<Arc<Tex>> {
+        self.end_pass();
+        let copy = match self.target_copies.get(&t.id) {
+            Some(c) => c.clone(),
+            None => {
+                let c = self.new_texture(
+                    t.width,
+                    t.height,
+                    t.levels,
+                    t.format.d3d,
+                    t.cube,
+                    false,
+                    t.samples,
+                )?;
+                self.target_copies.insert(t.id, c.clone());
+                c
+            }
+        };
+        let layers = if t.cube { 6 } else { 1 };
+        for level in 0..t.levels {
+            let size = wgpu::Extent3d {
+                width: (t.width >> level).max(1),
+                height: (t.height >> level).max(1),
+                depth_or_array_layers: layers,
+            };
+            self.encoder().copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &t.texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &copy.texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                size,
+            );
+        }
+        for x in [t, &copy] {
+            x.batch.store(self.batch, Ordering::Relaxed);
+        }
+        Some(copy)
     }
 
     fn current_targets(&mut self) -> Targets {
@@ -1779,6 +2445,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             })
             .forget_lifetime();
         self.pass = Some(pass);
+        self.binds = PassBinds::default();
         self.pass_targets = Some(targets);
         self.pass_count = count;
         // The surfaces' textures are in use by this batch.
@@ -2030,6 +2697,8 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             }],
         });
         self.begin_pass(None);
+        // The clear's own pipeline, group, viewport and scissor: the next draw sets its own.
+        self.binds = PassBinds::default();
         let pass = self.pass.as_mut().expect("a pass is open");
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &group, &[]);
@@ -2074,31 +2743,6 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             16 => (V::Float16x4, I::Float(4)),
             _ => return None,
         })
-    }
-
-    fn module(
-        &mut self,
-        source: Result<String, sm::Error>,
-        what: &str,
-    ) -> Option<wgpu::ShaderModule> {
-        let source = match source {
-            Ok(s) => s,
-            Err(e) => {
-                self.warn(format!("{what}: {e}"));
-                return None;
-            }
-        };
-        if let Err(e) = sm::validate(&source) {
-            self.warn(format!("{what}: the converted shader is not valid: {e}"));
-            return None;
-        }
-        Some(
-            self.device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: None,
-                    source: wgpu::ShaderSource::Wgsl(source.into()),
-                }),
-        )
     }
 
     fn sampler_layout(&mut self, key: &[(u32, u8, bool)]) -> wgpu::PipelineLayout {
@@ -2168,8 +2812,8 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
 
     /// The samplers both shaders use, as (binding, dimension, filterable) and the device sampler
     /// slot.
-    fn sampler_bindings(&self, vs: &Shader, ps: &Shader) -> Vec<((u32, u8, bool), usize)> {
-        let mut out = Vec::new();
+    fn sampler_bindings(&self, vs: &Shader, ps: &Shader) -> Bindings {
+        let mut out = Bindings::default();
         for (stage, shader) in [(Stage::Vertex, vs), (Stage::Pixel, ps)] {
             for &(n, dim) in &shader.sig.samplers {
                 let slot = match stage {
@@ -2185,10 +2829,64 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                     wgsl::Dim::D3 => 2,
                 };
                 let filterable = self.filterable(self.st.textures[slot].as_ref());
-                out.push(((wgsl::texture_binding(stage, n), d, filterable), slot));
+                if out.n < out.b.len() {
+                    out.b[out.n] = ((wgsl::texture_binding(stage, n), d, filterable), slot);
+                    out.n += 1;
+                }
             }
         }
         out
+    }
+
+    /// The vertex inputs of `vs` read from `decl`'s elements: each shader input from the
+    /// declaration's element of its usage, the attributes by stream. Made once for each pair.
+    fn vertex_link(&mut self, vs: &Shader, decl: &Decl) -> Arc<VertexLink> {
+        let key = (vs.id, decl.id);
+        if let Some((k, l)) = &self.last_link {
+            if *k == key {
+                return l.clone();
+            }
+        }
+        let link = match self.vertex_links.get(&key) {
+            Some(l) => l.clone(),
+            None => {
+                let mut inputs = vec![wgsl::Input::Missing; 16];
+                let mut attributes: [Vec<wgpu::VertexAttribute>; 8] = Default::default();
+                for (r, sem) in &vs.sig.inputs {
+                    if r.n >= 16 {
+                        continue;
+                    }
+                    let Some(e) = decl
+                        .elements
+                        .iter()
+                        .find(|e| e.usage == sem.usage && e.index == sem.index)
+                    else {
+                        continue;
+                    };
+                    let Some((format, input)) = Self::input_of(e.ty) else {
+                        self.warn(format!("vertex element type {} is not provided", e.ty));
+                        continue;
+                    };
+                    if e.stream >= 8 {
+                        continue;
+                    }
+                    inputs[r.n as usize] = input;
+                    attributes[e.stream as usize].push(wgpu::VertexAttribute {
+                        format,
+                        offset: u64::from(e.offset),
+                        shader_location: r.n,
+                    });
+                }
+                if self.vertex_links.len() >= 8192 {
+                    self.vertex_links.clear();
+                }
+                let l = Arc::new(VertexLink { inputs, attributes });
+                self.vertex_links.insert(key, l.clone());
+                l
+            }
+        };
+        self.last_link = Some((key, link.clone()));
+        link
     }
 
     fn topology(kind: u32) -> Option<wgpu::PrimitiveTopology> {
@@ -2216,28 +2914,26 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
     }
 
     /// The uniform blocks of the next draw; `centre`: the vertex shaders' half-pixel move in clip
-    /// space per unit of `w` (`1 / width`, `-1 / height` of the draw's viewport).
-    fn write_blocks(&mut self, centre: [f32; 2]) {
-        if !self.st.dirty && !self.ring.is_empty() && centre == self.block_centre {
-            return;
-        }
-        self.block_centre = centre;
+    /// space per unit of `w` (`1 / width`, `-1 / height` of the draw's viewport); `fregs`: the
+    /// float constants the vertex and pixel shader read ([`Shader::fregs`]). Each stage's block is
+    /// written again only when what it carries changed (or its shader reads constants beyond the
+    /// ones it carries), and carries only the constants up to the highest its shader reads: the
+    /// bytes a shader reads are the same as with whole blocks.
+    fn write_blocks(&mut self, centre: [f32; 2], fregs: [u32; 2]) {
         if self.ring.len() as u64 + 2 * BLOCK > RING {
             self.flush();
         }
-        let atoc = self.atoc();
-        let mut ring = std::mem::take(&mut self.ring);
-        let st = &self.st;
-        // The planes `D3DRS_CLIPPLANEENABLE` turns on (all off without `D3DRS_CLIPPING`); a plane
-        // that is off is zero, which keeps everything.
-        let mut clip = [[0u32; 4]; wgsl::CLIP_PLANES];
-        if st.rs[RS_CLIPPING] != 0 {
-            for (k, plane) in clip.iter_mut().enumerate() {
-                if st.rs[rs::CLIPPLANEENABLE] & (1 << k) != 0 {
-                    *plane = st.clip[k];
-                }
-            }
+        let fresh = self.ring.is_empty();
+        let vs_due = fresh
+            || self.st.dirty[0]
+            || centre != self.block_centre
+            || fregs[0] > self.block_fregs[0];
+        let ps_due = fresh || self.st.dirty[1] || fregs[1] > self.block_fregs[1];
+        if !vs_due && !ps_due {
+            return;
         }
+        let atoc = ps_due && self.atoc();
+        let st = &self.st;
         // Each sampler's fill mode (its texture's format) and LOD bias.
         let per_sampler = |range: std::ops::Range<usize>| -> ([u32; 16], [f32; 16]) {
             let mut fix = [0u32; 16];
@@ -2248,40 +2944,73 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             }
             (fix, bias)
         };
-        // The vertex stage's system values: the half-pixel move of Direct3D 9's pixel centres.
-        let vs_sys = [centre[0], centre[1], 0.0, 0.0];
-        // The alpha test, unless alpha to coverage stands in for it ([`ATOC`]: then the
-        // comparisons NEVER, LESS, EQUAL and LESSEQUAL draw nothing, the others pass everything
-        // and the coverage comes from the alpha alone).
-        let alpha_func = match (st.rs[rs::ALPHATESTENABLE] != 0, atoc) {
-            (false, _) => 8.0,
-            (true, false) => st.rs[rs::ALPHAFUNC] as f32,
-            (true, true) if (1..=4).contains(&st.rs[rs::ALPHAFUNC]) => 1.0,
-            (true, true) => 8.0,
-        };
-        let (above, from) = alpha_bounds(st.rs[rs::ALPHAREF] & 0xFF);
-        let ps_sys = [above, alpha_func, from, 0.0];
-        let vs = write_block(
-            &mut ring,
-            &st.vsf,
-            &st.vsi,
-            &st.vsb,
-            vs_sys,
-            per_sampler(16..20),
-            &clip,
-        );
-        let ps = write_block(
-            &mut ring,
-            &st.psf,
-            &st.psi,
-            &st.psb,
-            ps_sys,
-            per_sampler(0..16),
-            &[[0; 4]; wgsl::CLIP_PLANES],
-        );
-        self.ring = ring;
-        self.blocks = (vs, ps);
-        self.st.dirty = false;
+        // A stage's header (everything before its float constants) is made again only when
+        // something it carries changed ([`State::header_dirty`]); the float constants, which
+        // most draws change, are copied as they are held.
+        if vs_due {
+            if st.header_dirty[0] || centre != self.header_centre {
+                // The planes `D3DRS_CLIPPLANEENABLE` turns on (all off without `D3DRS_CLIPPING`);
+                // a plane that is off is zero, which keeps everything.
+                let mut clip = [[0u32; 4]; wgsl::CLIP_PLANES];
+                if st.rs[RS_CLIPPING] != 0 {
+                    for (k, plane) in clip.iter_mut().enumerate() {
+                        if st.rs[rs::CLIPPLANEENABLE] & (1 << k) != 0 {
+                            *plane = st.clip[k];
+                        }
+                    }
+                }
+                // The vertex stage's system values: the half-pixel move of Direct3D 9's pixel
+                // centres.
+                let vs_sys = [centre[0], centre[1], 0.0, 0.0];
+                self.headers[0] =
+                    block_header(&st.vsi, &st.vsb, vs_sys, per_sampler(16..20), &clip);
+                self.header_centre = centre;
+            }
+            self.blocks.0 = write_block(
+                &mut self.ring,
+                &self.headers[0],
+                &self.st.vsf[..16 * fregs[0] as usize],
+            );
+            self.block_centre = centre;
+            self.block_fregs[0] = fregs[0];
+        }
+        let st = &self.st;
+        if ps_due {
+            if st.header_dirty[1] || atoc != self.header_atoc {
+                // The alpha test, unless alpha to coverage stands in for it ([`ATOC`]: then the
+                // comparisons NEVER, LESS, EQUAL and LESSEQUAL draw nothing, the others pass
+                // everything and the coverage comes from the alpha alone).
+                let alpha_func = match (st.rs[rs::ALPHATESTENABLE] != 0, atoc) {
+                    (false, _) => 8.0,
+                    (true, false) => st.rs[rs::ALPHAFUNC] as f32,
+                    (true, true) if (1..=4).contains(&st.rs[rs::ALPHAFUNC]) => 1.0,
+                    (true, true) => 8.0,
+                };
+                let (above, from) = alpha_bounds(st.rs[rs::ALPHAREF] & 0xFF);
+                let ps_sys = [above, alpha_func, from, 0.0];
+                self.headers[1] = block_header(
+                    &st.psi,
+                    &st.psb,
+                    ps_sys,
+                    per_sampler(0..16),
+                    &[[0; 4]; wgsl::CLIP_PLANES],
+                );
+                self.header_atoc = atoc;
+            }
+            self.blocks.1 = write_block(
+                &mut self.ring,
+                &self.headers[1],
+                &self.st.psf[..16 * fregs[1] as usize],
+            );
+            self.block_fregs[1] = fregs[1];
+        }
+        if vs_due {
+            self.st.header_dirty[0] = false;
+        }
+        if ps_due {
+            self.st.header_dirty[1] = false;
+        }
+        self.st.dirty = [false; 2];
     }
 
     fn sampler(&mut self, key: SamplerKey) -> wgpu::Sampler {
@@ -2303,6 +3032,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         count: u32,
         up: Option<(&[u8], u32)>,
     ) {
+        // Listed pipelines whose shaders are now made, also when the game draws before its first
+        // `Present` (its first frame).
+        if self.listed_new {
+            self.prepare_listed();
+        }
         let (Some(vs), Some(ps)) = (self.st.vs.clone(), self.st.ps.clone()) else {
             self.warn("a draw without both shaders (fixed function is not provided): skipped");
             self.skipped += 1;
@@ -2322,34 +3056,10 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             self.skipped += 1;
             return;
         }
-        // The vertex inputs: each shader input from the declaration's element of its usage.
-        let mut inputs = vec![wgsl::Input::Missing; 16];
-        let mut attributes: [Vec<wgpu::VertexAttribute>; 8] = Default::default();
-        for (r, sem) in &vs.sig.inputs {
-            if r.n >= 16 {
-                continue;
-            }
-            let Some(e) = decl
-                .elements
-                .iter()
-                .find(|e| e.usage == sem.usage && e.index == sem.index)
-            else {
-                continue;
-            };
-            let Some((format, input)) = Self::input_of(e.ty) else {
-                self.warn(format!("vertex element type {} is not provided", e.ty));
-                continue;
-            };
-            if e.stream >= 8 {
-                continue;
-            }
-            inputs[r.n as usize] = input;
-            attributes[e.stream as usize].push(wgpu::VertexAttribute {
-                format,
-                offset: u64::from(e.offset),
-                shader_location: r.n,
-            });
-        }
+        // The vertex inputs: each shader input from the declaration's element of its usage
+        // (linked once for each vertex shader and declaration).
+        let link = self.vertex_link(&vs, &decl);
+        let attributes = &link.attributes;
         let mut strides = [0u32; 8];
         for (k, a) in attributes.iter().enumerate() {
             if !a.is_empty() {
@@ -2360,11 +3070,24 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 };
             }
         }
-        let varyings: Vec<wgsl::Semantic> = ps.sig.inputs.iter().map(|(_, s)| *s).collect();
         let samplers = self.sampler_bindings(&vs, &ps);
+        let samplers = samplers.as_slice();
+        let filterable = samplers
+            .iter()
+            .enumerate()
+            .fold(0u32, |m, (i, &((_, _, f), _))| m | (u32::from(f) << i));
         let index32 = indexed && self.st.indices.as_ref().is_some_and(|b| b.index32);
         let depth = self.usable_depth();
         let atoc = self.atoc();
+        let samples = self
+            .st
+            .rt
+            .iter()
+            .flatten()
+            .next()
+            .map(|s| s.samples)
+            .or(depth.as_ref().map(|d| d.samples))
+            .unwrap_or(1);
         let key = PipeKey {
             vs: vs.id,
             ps: ps.id,
@@ -2379,85 +3102,146 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             }),
             depth: depth.as_ref().map(|d| d.format.wgpu),
             states: PIPELINE_STATES.map(|s| self.st.rs[s]),
-            samples: self
-                .st
-                .rt
-                .iter()
-                .flatten()
-                .next()
-                .map(|s| s.samples)
-                .or(depth.as_ref().map(|d| d.samples))
-                .unwrap_or(1),
-            samplers: samplers.iter().map(|(k, _)| *k).collect(),
+            samples,
+            filterable,
             atoc,
             count: self.counting.is_some(),
-            clip: wgsl::Clip::Off,
+            clip: self.clip_link(samples),
         };
-        let key = PipeKey {
-            clip: self.clip_link(key.samples),
-            ..key
-        };
-        if !self.pipelines.contains_key(&key) {
-            // Bounded: render states with continuous values (depth bias) could grow it without end.
-            if self.pipelines.len() >= 4096 {
-                self.pipelines.clear();
+        // The last draw's pipeline again (most draws), else the cache's, else a new one.
+        let made = match &self.last_pipeline {
+            Some((k, p)) if *k == key => p.clone(),
+            _ => {
+                if !self.pipelines.contains_key(&key) {
+                    // Bounded: render states with continuous values (depth bias) could grow it
+                    // without end.
+                    if self.pipelines.len() >= 4096 {
+                        self.pipelines.clear();
+                    }
+                    let sampler_keys: Vec<(u32, u8, bool)> =
+                        samplers.iter().map(|(k, _)| *k).collect();
+                    let pipeline = self.make_pipeline(
+                        &key,
+                        &vs,
+                        &ps,
+                        &link.inputs,
+                        &ps.varyings,
+                        attributes,
+                        topology,
+                        &sampler_keys,
+                    );
+                    self.pipelines.insert(key.clone(), pipeline);
+                    // Listed, so the next start makes it before play ([`prepare`]).
+                    if self.list.is_some() {
+                        let entry = prepare::Entry {
+                            vs: vs.stable,
+                            ps: ps.stable,
+                            decl: decl
+                                .elements
+                                .iter()
+                                .map(|e| (e.stream, e.offset, e.ty, e.usage, e.index))
+                                .collect(),
+                            strides,
+                            topology: kind as u8,
+                            index32,
+                            colours: std::array::from_fn(|i| {
+                                self.st.rt[i].as_ref().map(|s| s.format.d3d)
+                            }),
+                            depth: depth.as_ref().map(|d| d.format.d3d),
+                            states: key.states,
+                            samples,
+                            filterable,
+                            atoc,
+                            count: key.count,
+                            clip: clip_code(key.clip),
+                        };
+                        let presents = self.presents;
+                        if let Some(l) = &mut self.list {
+                            l.add(entry, presents);
+                        }
+                    }
+                }
+                let p = self.pipelines.get(&key).cloned().flatten();
+                self.last_pipeline = Some((key, p.clone()));
+                p
             }
-            let pipeline =
-                self.make_pipeline(&key, &vs, &ps, &inputs, &varyings, &attributes, topology);
-            self.pipelines.insert(key.clone(), pipeline);
-        }
-        let Some(pipeline) = self.pipelines.get(&key).cloned().flatten() else {
+        };
+        let Some((pipeline, group_layout)) = made else {
             self.skipped += 1;
             return;
         };
-        // The textures and samplers.
-        let mut group_key = Vec::with_capacity(samplers.len());
-        for &((binding, _, filterable), slot) in &samplers {
-            let tex_id = self.st.textures[slot].as_ref().map_or(0, |t| t.id);
+        // A texture the draw samples that is also one of its colour targets (a level or a face of
+        // it): Direct3D 9 draws so, and wgpu refuses such a pass and with it the whole submit. The
+        // game does it when the water displacement is set up near water: its texture-offset pass
+        // (ISWATERDISPLACEMENTTEXOFFSET) and then an image-space copy with an offset (ISCOPY) draw
+        // into the 512x512 displacement texture while sampling it, and that frame lost every draw
+        // (a repeatable run's recording, the route's run near x -49,100, y 10,400). The draw
+        // samples a copy of that texture instead, made just before it
+        // ([`Device::copy_for_sampling`]): what the target held before this draw.
+        let mut copies: [Option<Arc<Tex>>; 20] = Default::default();
+        for &(_, slot) in samplers {
+            if let Some(t) = self.st.textures[slot].clone() {
+                if self.is_colour_target(&t) {
+                    copies[slot] = self.copy_for_sampling(&t);
+                }
+            }
+        }
+        // The textures and samplers: the last draw's bind group again, else the cache's.
+        let mut group_key = [(0u32, 0u8, 0u64, None::<SamplerKey>); 20];
+        for (g, &((binding, dim, filterable), slot)) in group_key.iter_mut().zip(samplers) {
+            let tex_id = copies[slot]
+                .as_ref()
+                .or(self.st.textures[slot].as_ref())
+                .map_or(0, |t| t.id);
             let sk = SamplerKey::new(&self.st.samplers[slot], filterable);
-            group_key.push((binding, tex_id, Some(sk)));
+            *g = (binding, dim, tex_id, Some(sk));
         }
-        if !self.groups.contains_key(&group_key) {
-            if self.groups.len() > 8192 {
-                self.groups.clear();
+        let group_key = &group_key[..samplers.len()];
+        let group = match &self.last_group {
+            (k, Some(g)) if k.as_slice() == group_key => g.clone(),
+            _ => {
+                if !self.groups.contains_key(group_key) {
+                    if self.groups.len() > 8192 {
+                        self.groups.clear();
+                    }
+                    let mut views = Vec::new();
+                    let mut samps = Vec::new();
+                    for &((binding, dim, filterable), slot) in samplers {
+                        let view = match copies[slot].as_ref().or(self.st.textures[slot].as_ref()) {
+                            Some(t) if (dim == 1) == t.cube => t.view.clone(),
+                            _ => self.dummy[dim as usize].clone(),
+                        };
+                        let sk = SamplerKey::new(&self.st.samplers[slot], filterable);
+                        views.push((binding, view));
+                        samps.push((binding + 1, self.sampler(sk)));
+                    }
+                    let mut entries = Vec::new();
+                    for (b, v) in &views {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: *b,
+                            resource: wgpu::BindingResource::TextureView(v),
+                        });
+                    }
+                    for (b, s) in &samps {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: *b,
+                            resource: wgpu::BindingResource::Sampler(s),
+                        });
+                    }
+                    let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &group_layout,
+                        entries: &entries,
+                    });
+                    self.groups.insert(group_key.to_vec(), group);
+                }
+                let group = self.groups[group_key].clone();
+                self.last_group.0.clear();
+                self.last_group.0.extend_from_slice(group_key);
+                self.last_group.1 = Some(group.clone());
+                group
             }
-            let (layout, _) = self
-                .sampler_layouts
-                .get(&key.samplers)
-                .expect("made with the pipeline");
-            let layout = layout.clone();
-            let mut views = Vec::new();
-            let mut samps = Vec::new();
-            for &((binding, dim, filterable), slot) in &samplers {
-                let view = match &self.st.textures[slot] {
-                    Some(t) if (dim == 1) == t.cube => t.view.clone(),
-                    _ => self.dummy[dim as usize].clone(),
-                };
-                let sk = SamplerKey::new(&self.st.samplers[slot], filterable);
-                views.push((binding, view));
-                samps.push((binding + 1, self.sampler(sk)));
-            }
-            let mut entries = Vec::new();
-            for (b, v) in &views {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: *b,
-                    resource: wgpu::BindingResource::TextureView(v),
-                });
-            }
-            for (b, s) in &samps {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: *b,
-                    resource: wgpu::BindingResource::Sampler(s),
-                });
-            }
-            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &layout,
-                entries: &entries,
-            });
-            self.groups.insert(group_key.clone(), group);
-        }
-        let group = self.groups[&group_key].clone();
+        };
         // Vertices from DrawPrimitiveUP go into the batch's ring.
         let up_offset = if let Some((bytes, _)) = up {
             if self.up.len() + bytes.len() > UP_RING as usize {
@@ -2486,7 +3270,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         let vh = v.h.min(th - vy).max(1);
         // Direct3D 9's pixel centres: each vertex shader moves its position half a pixel right
         // and down, by this viewport's size (the converter's module documentation).
-        self.write_blocks([1.0 / vw as f32, -1.0 / vh as f32]);
+        self.write_blocks([1.0 / vw as f32, -1.0 / vh as f32], [vs.fregs, ps.fregs]);
         self.begin_pass(None);
         let scissor = if self.st.rs[rs::SCISSORTESTENABLE] != 0 {
             let r = self.st.scissor;
@@ -2501,22 +3285,16 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         if scissor.2 == 0 || scissor.3 == 0 {
             return;
         }
-        let (vs_block, ps_block) = self.blocks;
+        let blocks = self.blocks;
         let stencil_ref = self.st.rs[rs::STENCILREF] & 0xFF;
         let bf = self.st.rs[rs::BLENDFACTOR];
-        let blend_constant = wgpu::Color {
-            r: f64::from((bf >> 16) & 0xFF) / 255.0,
-            g: f64::from((bf >> 8) & 0xFF) / 255.0,
-            b: f64::from(bf & 0xFF) / 255.0,
-            a: f64::from(bf >> 24) / 255.0,
-        };
-        let mut streams = Vec::new();
+        let mut streams: [Option<(wgpu::Buffer, u64)>; 8] = Default::default();
         for (k, a) in attributes.iter().enumerate() {
             if a.is_empty() {
                 continue;
             }
             if up.is_some() && k == 0 {
-                streams.push((k as u32, self.up_buffer.clone(), up_offset.unwrap_or(0)));
+                streams[k] = Some((self.up_buffer.clone(), up_offset.unwrap_or(0)));
                 continue;
             }
             match &self.st.streams[k].buffer {
@@ -2530,7 +3308,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                         return;
                     }
                     b.batch.store(self.batch, Ordering::Relaxed);
-                    streams.push((k as u32, b.buffer.clone(), offset));
+                    streams[k] = Some((b.buffer.clone(), offset));
                 }
                 None => {
                     self.warn("a draw with a stream the declaration uses unbound: skipped");
@@ -2563,8 +3341,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         };
         // The textures are this batch's from here (after any send above), so an upload into one
         // later in the batch sends the batch first.
-        for &(_, slot) in &samplers {
-            if let Some(t) = &self.st.textures[slot] {
+        for &(_, slot) in samplers {
+            for t in [&self.st.textures[slot], &copies[slot]]
+                .into_iter()
+                .flatten()
+            {
                 t.batch.store(self.batch, Ordering::Relaxed);
             }
         }
@@ -2573,52 +3354,328 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         // are the vertex shaders' move, above: a viewport moved half a pixel would cut through
         // the edge pixels on an adapter that clips at the viewport's exact edge: WARP, the
         // software adapter, does, and lost 15 of the 64 samples of a 4 by 4 target at 4x).
-        let pass = self.pass.as_mut().expect("a pass is open");
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &self.ring_group, &[vs_block, ps_block]);
-        pass.set_bind_group(1, &group, &[]);
-        pass.set_viewport(
+        // Each of the pass's settings is sent only when it differs from what the pass has.
+        let viewport = [
             vx as f32,
             vy as f32,
             vw as f32,
             vh as f32,
             v.min_z.clamp(0.0, 1.0),
             v.max_z.clamp(0.0, 1.0),
-        );
-        pass.set_scissor_rect(scissor.0, scissor.1, scissor.2, scissor.3);
-        pass.set_stencil_reference(stencil_ref);
-        pass.set_blend_constant(blend_constant);
-        for (slot, buffer, offset) in &streams {
-            pass.set_vertex_buffer(*slot, buffer.slice(*offset..));
+        ]
+        .map(f32::to_bits);
+        let b = &mut self.binds;
+        let pass = self.pass.as_mut().expect("a pass is open");
+        if b.pipeline.as_ref() != Some(&pipeline) {
+            pass.set_pipeline(&pipeline);
+            b.pipeline = Some(pipeline);
+        }
+        if b.blocks != Some(blocks) {
+            pass.set_bind_group(0, &self.ring_group, &[blocks.0, blocks.1]);
+            b.blocks = Some(blocks);
+        }
+        if b.group.as_ref() != Some(&group) {
+            pass.set_bind_group(1, &group, &[]);
+            b.group = Some(group);
+        }
+        if b.viewport != Some(viewport) {
+            let f = viewport.map(f32::from_bits);
+            pass.set_viewport(f[0], f[1], f[2], f[3], f[4], f[5]);
+            b.viewport = Some(viewport);
+        }
+        if b.scissor != Some(scissor) {
+            pass.set_scissor_rect(scissor.0, scissor.1, scissor.2, scissor.3);
+            b.scissor = Some(scissor);
+        }
+        if b.stencil != Some(stencil_ref) {
+            pass.set_stencil_reference(stencil_ref);
+            b.stencil = Some(stencil_ref);
+        }
+        if b.blend != Some(bf) {
+            pass.set_blend_constant(wgpu::Color {
+                r: f64::from((bf >> 16) & 0xFF) / 255.0,
+                g: f64::from((bf >> 8) & 0xFF) / 255.0,
+                b: f64::from(bf & 0xFF) / 255.0,
+                a: f64::from(bf >> 24) / 255.0,
+            });
+            b.blend = Some(bf);
+        }
+        for (slot, s) in streams.into_iter().enumerate() {
+            if s.is_none() || b.streams[slot] == s {
+                continue;
+            }
+            if let Some((buffer, offset)) = &s {
+                pass.set_vertex_buffer(slot as u32, buffer.slice(*offset..));
+            }
+            b.streams[slot] = s;
         }
         match index {
-            Some((buffer, index32)) => {
-                pass.set_index_buffer(
-                    buffer.slice(..),
-                    if index32 {
-                        wgpu::IndexFormat::Uint32
-                    } else {
-                        wgpu::IndexFormat::Uint16
-                    },
-                );
+            Some(i) => {
+                if b.index.as_ref() != Some(&i) {
+                    pass.set_index_buffer(
+                        i.0.slice(..),
+                        if i.1 {
+                            wgpu::IndexFormat::Uint32
+                        } else {
+                            wgpu::IndexFormat::Uint16
+                        },
+                    );
+                    b.index = Some(i);
+                }
                 pass.draw_indexed(start..start + n, base_vertex, 0..1);
             }
             None => pass.draw(start..start + n, 0..1),
         }
         self.draws += 1;
+        // Every [`SPLIT_DRAWS`] draws the open encoder goes to a finishing thread: wgpu does its
+        // checking and the driver's recording when an encoder is finished, and those of different
+        // encoders run side by side. The next draw opens a new pass (it loads what this one
+        // stored) in a new encoder.
+        self.encoder_draws += 1;
+        if self.encoder_draws >= SPLIT_DRAWS && self.finisher.is_some() {
+            self.send_encoder();
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn make_pipeline(
+    /// The one shader with bytecode hash `hash`, unless two bytecodes share it.
+    fn shader_by_hash(&self, hash: u64) -> Option<Arc<Shader>> {
+        if self.collided.contains(&hash) {
+            return None;
+        }
+        match self.shader_bytecode.get(&hash).map(Vec::as_slice) {
+            Some([one]) => Some(one.clone()),
+            _ => None,
+        }
+    }
+
+    /// The live key and the parts a pipeline of the listed `e` is made from, its two shaders
+    /// made; None when the entry names something this backend cannot make (a format it lacks).
+    fn key_of_entry(
         &mut self,
+        e: &prepare::Entry,
+        vs: Arc<Shader>,
+        ps: Arc<Shader>,
+    ) -> Option<Ready> {
+        let topology = Self::topology(u32::from(e.topology))?;
+        let elements = e
+            .decl
+            .iter()
+            .map(|&(stream, offset, ty, usage, index)| Element {
+                stream,
+                offset,
+                ty,
+                usage,
+                index,
+            })
+            .collect();
+        let decl = self.decl_of(elements);
+        let link = self.vertex_link(&vs, &decl);
+        let mut colours = [None; 4];
+        for (c, d) in colours.iter_mut().zip(e.colours) {
+            if let Some(d) = d {
+                let f = format::format(d)?;
+                *c = Some((f.wgpu, f.opaque));
+            }
+        }
+        let depth = match e.depth {
+            Some(d) => Some(format::format(d)?.wgpu),
+            None => None,
+        };
+        let mut bindings = self.sampler_bindings(&vs, &ps);
+        for (i, b) in bindings.b[..bindings.n].iter_mut().enumerate() {
+            b.0 .2 = e.filterable & (1 << i) != 0;
+        }
+        let samplers = bindings.as_slice().iter().map(|(k, _)| *k).collect();
+        let key = PipeKey {
+            vs: vs.id,
+            ps: ps.id,
+            decl: decl.id,
+            strides: e.strides,
+            topology: e.topology,
+            index32: e.index32,
+            colours,
+            depth,
+            states: e.states,
+            samples: e.samples,
+            filterable: e.filterable,
+            atoc: e.atoc,
+            count: e.count,
+            // Planes on or off is the entry's; how they are cut is this adapter's (a list made on
+            // Direct3D 12 serves Vulkan too).
+            clip: if e.clip == 0 {
+                wgsl::Clip::Off
+            } else if self.clip_distances {
+                wgsl::Clip::Distances
+            } else {
+                wgsl::Clip::Discard {
+                    per_sample: e.samples > 1,
+                }
+            },
+        };
+        Some(Ready {
+            key,
+            vs,
+            ps,
+            link,
+            topology,
+            samplers,
+        })
+    }
+
+    /// Makes, before the game goes on, every listed pipeline whose two shaders the game has made
+    /// ([`prepare`]), at the sample counts its surfaces have: a single-sampled entry when it is
+    /// listed so, a multisampled one at each multisample count the surfaces have (a list
+    /// recorded at 4x serves a player at 8x: the same draws on that player's targets), where
+    /// its formats take that count. The modules first, then the pipelines, each on the worker
+    /// threads. At a `Present`, after a new shader or sample count; the game waits for it (its
+    /// next frame comes after), so no listed pipeline is ever made during play.
+    fn prepare_listed(&mut self) {
+        if !self.listed_new {
+            return;
+        }
+        self.listed_new = false;
+        let Some(mut l) = self.list.take() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let mut ready = Vec::new();
+        let mut ahead = HashSet::new();
+        for i in 0..l.list.entries.len() {
+            let e = &l.list.entries[i];
+            let want = if e.samples > 1 {
+                self.sample_mask & !0b11
+            } else {
+                self.sample_mask & (1u32 << e.samples.min(31))
+            };
+            let todo = want & !l.done[i];
+            if todo == 0 {
+                continue;
+            }
+            let (Some(vs), Some(ps)) = (self.shader_by_hash(e.vs), self.shader_by_hash(e.ps))
+            else {
+                continue;
+            };
+            l.done[i] |= todo;
+            let e = e.clone();
+            for samples in (1..32u32).filter(|n| todo & (1 << n) != 0) {
+                let formats_take_it = samples == e.samples
+                    || e.colours.iter().flatten().chain(&e.depth).all(|&d| {
+                        format::format(d).is_some_and(|f| self.samples_supported(f.wgpu, samples))
+                    });
+                if !formats_take_it {
+                    continue;
+                }
+                let e = prepare::Entry {
+                    samples,
+                    ..e.clone()
+                };
+                if let Some(r) = self.key_of_entry(&e, vs.clone(), ps.clone()) {
+                    // Two entries can name one pipeline (one recorded at 4x and one at 8x).
+                    if !self.pipelines.contains_key(&r.key) && ahead.insert(r.key.clone()) {
+                        ready.push(r);
+                    }
+                }
+            }
+        }
+        if ready.is_empty() {
+            self.list = Some(l);
+            return;
+        }
+        let threads = worker_threads();
+        let mut tasks = Vec::new();
+        let mut keys = Vec::new();
+        for r in &ready {
+            let (vk, pk, t) =
+                self.module_tasks(&r.key, &r.vs, &r.ps, &r.link.inputs, &r.ps.varyings);
+            tasks.extend(t);
+            keys.push((vk, pk));
+        }
+        let modules = {
+            let mut seen = HashSet::new();
+            tasks.iter().filter(|t| seen.insert(t.key.clone())).count()
+        };
+        // The loading screen while it runs, when it is a long step (the start's; a few pipelines
+        // ready later, after a new sample count, are made without it).
+        let total = modules + ready.len();
+        let shown = total >= 32;
+        let mut surface = self.surface.take();
+        let mut screen = self.loading.take();
+        let (device, queue) = (self.device.clone(), self.queue.clone());
+        let mut step = |done: usize| {
+            if shown {
+                let p = loading::Progress {
+                    title: "Loading".into(),
+                    status: format!("Preparing shaders {} of {}", done.min(total), total),
+                    done: done as f32 / total.max(1) as f32,
+                };
+                show_on(&mut surface, &mut screen, &device, &queue, &p);
+            }
+        };
+        let t = std::time::Instant::now();
+        self.make_modules(tasks, threads, false, &mut step);
+        let modules_took = t.elapsed();
+        let mut jobs = Vec::new();
+        for (r, (vk, pk)) in ready.iter().zip(&keys) {
+            if let Some(j) = self.pipeline_job(
+                &r.key,
+                &r.ps,
+                vk,
+                pk,
+                &r.link.attributes,
+                r.topology,
+                &r.samplers,
+            ) {
+                jobs.push((r.key.clone(), j));
+            }
+        }
+        let cache = self.pipeline_cache.as_ref().map(|c| &c.cache);
+        let built = on_workers(
+            &jobs,
+            threads,
+            |(_, j)| build_pipeline(&device, cache, j),
+            &mut |d| step(modules + d),
+        );
+        step(total);
+        drop(step);
+        self.surface = surface;
+        self.loading = screen;
+        let mut refused = 0;
+        let made = jobs.len();
+        for ((key, j), b) in jobs.into_iter().zip(built) {
+            match b {
+                Ok(p) => {
+                    self.pipelines.insert(key, Some((p, j.group_layout)));
+                }
+                Err(e) => {
+                    refused += 1;
+                    self.warn(format!("a pipeline wgpu refuses: {e}"));
+                    self.pipelines.insert(key, None);
+                }
+            }
+        }
+        if let Some(c) = &self.pipeline_cache {
+            c.touched(self.presents);
+        }
+        let left = l.done.iter().filter(|&&d| d == 0).count();
+        eprintln!(
+            "NV_D3D9 wgpu: made ahead: {made} pipelines and {modules} shader modules in {:.0} ms (modules {:.0} ms) on {threads} threads, {refused} refused; {left} listed not yet possible (present {})",
+            started.elapsed().as_secs_f64() * 1000.0,
+            modules_took.as_secs_f64() * 1000.0,
+            self.presents
+        );
+        self.list = Some(l);
+    }
+
+    /// The cache keys of the two modules a pipeline of `key` takes, and the work to make each
+    /// one not made yet (its WGSL converted here, the module made by [`Device::make_modules`]).
+    fn module_tasks(
+        &self,
         key: &PipeKey,
         vs: &Shader,
         ps: &Shader,
         inputs: &[wgsl::Input],
         varyings: &[wgsl::Semantic],
-        attributes: &[Vec<wgpu::VertexAttribute>; 8],
-        topology: wgpu::PrimitiveTopology,
-    ) -> Option<wgpu::RenderPipeline> {
+    ) -> (VKey, PKey, Vec<ModuleTask>) {
         let vkey = (
             vs.id,
             inputs.to_vec(),
@@ -2626,6 +3683,8 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             ps.sig.centroid.clone(),
             key.clip,
         );
+        let pkey = (ps.id, varyings.to_vec(), key.count, key.clip);
+        let mut tasks = Vec::new();
         if !self.vs_modules.contains_key(&vkey) {
             let link = wgsl::Link {
                 inputs: inputs.to_vec(),
@@ -2634,10 +3693,14 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 clip: key.clip,
                 count: false,
             };
-            let m = self.module(wgsl::convert(&vs.program, &link), "a vertex shader");
-            self.vs_modules.insert(vkey.clone(), m);
+            let t = std::time::Instant::now();
+            let source = wgsl::convert(&vs.program, &link);
+            tasks.push(ModuleTask {
+                key: ModKey::V(vkey.clone()),
+                source,
+                convert: t.elapsed(),
+            });
         }
-        let pkey = (ps.id, varyings.to_vec(), key.count, key.clip);
         if !self.ps_modules.contains_key(&pkey) {
             let link = wgsl::Link {
                 inputs: Vec::new(),
@@ -2646,30 +3709,104 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 clip: key.clip,
                 count: key.count,
             };
-            let m = self.module(wgsl::convert(&ps.program, &link), "a pixel shader");
-            self.ps_modules.insert(pkey.clone(), m);
+            let t = std::time::Instant::now();
+            let source = wgsl::convert(&ps.program, &link);
+            tasks.push(ModuleTask {
+                key: ModKey::P(pkey.clone()),
+                source,
+                convert: t.elapsed(),
+            });
         }
-        let vm = self.vs_modules[&vkey].clone()?;
-        let pm = self.ps_modules[&pkey].clone()?;
-        let layout = self.sampler_layout(&key.samplers);
+        (vkey, pkey, tasks)
+    }
+
+    /// Makes the modules of `tasks` (each once, on `threads` worker threads; 1: here) and keeps
+    /// them; a module wgpu or the converter refuses is kept as none and said once. `on_draw`: for
+    /// a draw's pipeline, counted in the pipeline report (modules made ahead have a line of their
+    /// own, [`Device::prepare_listed`]).
+    fn make_modules(
+        &mut self,
+        mut tasks: Vec<ModuleTask>,
+        threads: usize,
+        on_draw: bool,
+        tick: &mut dyn FnMut(usize),
+    ) {
+        let mut seen = HashSet::new();
+        tasks.retain(|t| seen.insert(t.key.clone()));
+        let device = self.device.clone();
+        let made = on_workers(
+            &tasks,
+            threads,
+            |t| {
+                let start = std::time::Instant::now();
+                let m = match &t.source {
+                    Ok(s) => create_module(&device, s.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                (m, start.elapsed())
+            },
+            tick,
+        );
+        for (t, (m, took)) in tasks.into_iter().zip(made) {
+            if on_draw {
+                self.made.add_module(t.convert, took);
+            }
+            let what = match t.key {
+                ModKey::V(_) => "a vertex shader",
+                ModKey::P(_) => "a pixel shader",
+            };
+            let m = match m {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    self.warn(format!("{what}: the converted shader is not valid: {e}"));
+                    None
+                }
+            };
+            match t.key {
+                ModKey::V(k) => {
+                    self.vs_modules.insert(k, m);
+                }
+                ModKey::P(k) => {
+                    self.ps_modules.insert(k, m);
+                }
+            }
+        }
+    }
+
+    /// What making a pipeline of `key` takes, its modules made ([`Device::make_modules`]); None
+    /// when one of them was refused.
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_job(
+        &mut self,
+        key: &PipeKey,
+        ps: &Shader,
+        vkey: &VKey,
+        pkey: &PKey,
+        attributes: &[Vec<wgpu::VertexAttribute>; 8],
+        topology: wgpu::PrimitiveTopology,
+        samplers: &[(u32, u8, bool)],
+    ) -> Option<PipelineJob> {
+        let vm = self.vs_modules.get(vkey)?.clone()?;
+        let pm = self.ps_modules.get(pkey)?.clone()?;
+        let layout = self.sampler_layout(samplers);
+        let group_layout = self.sampler_layouts[samplers].0.clone();
         // One layout per stream slot up to the last used (a slot's index is its stream's number).
         let last = attributes
             .iter()
             .rposition(|a| !a.is_empty())
             .map_or(0, |i| i + 1);
-        let buffers: Vec<Option<wgpu::VertexBufferLayout>> = attributes[..last]
+        let buffers = attributes[..last]
             .iter()
             .enumerate()
-            .map(|(k, a)| {
-                (!a.is_empty()).then(|| wgpu::VertexBufferLayout {
-                    array_stride: u64::from(key.strides[k]),
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: a,
-                })
-            })
+            .map(|(k, a)| (!a.is_empty()).then(|| (u64::from(key.strides[k]), a.clone())))
             .collect();
-        let s = &self.st.rs;
-        let blend = state::blend(s);
+        // The render states the pipeline is made from: the key's own, so a pipeline made ahead
+        // ([`prepare`]) is the one a draw with those states would make.
+        let mut s = [0u32; 256];
+        for (k, &state) in PIPELINE_STATES.iter().enumerate() {
+            s[state] = key.states[k];
+        }
+        let blend = state::blend(&s);
         let colour_states = [
             rs::COLORWRITEENABLE,
             rs::COLORWRITEENABLE1,
@@ -2714,15 +3851,12 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
         );
-        let desc = wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &vm,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                buffers: &buffers,
-            },
+        Some(PipelineJob {
+            layout,
+            group_layout,
+            vm,
+            pm,
+            buffers,
             primitive: wgpu::PrimitiveState {
                 topology,
                 strip_index_format: strip.then_some(if key.index32 {
@@ -2736,26 +3870,58 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: key.depth.map(|f| state::depth_stencil(s, f)),
+            depth_stencil: key.depth.map(|f| state::depth_stencil(&s, f)),
             multisample: wgpu::MultisampleState {
                 count: key.samples,
                 mask: !0,
                 alpha_to_coverage_enabled: key.atoc,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &pm,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &targets,
-            }),
-            multiview_mask: None,
-            cache: None,
-        };
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = self.device.create_render_pipeline(&desc);
-        match block_on(scope.pop()) {
-            None => Some(pipeline),
-            Some(e) => {
+            targets,
+        })
+    }
+
+    /// A pipeline made on a draw that needs it (not made ahead): it holds that draw, and so its
+    /// frame, until it is done; one that takes over a millisecond is said with its shaders.
+    #[allow(clippy::too_many_arguments)]
+    fn make_pipeline(
+        &mut self,
+        key: &PipeKey,
+        vs: &Shader,
+        ps: &Shader,
+        inputs: &[wgsl::Input],
+        varyings: &[wgsl::Semantic],
+        attributes: &[Vec<wgpu::VertexAttribute>; 8],
+        topology: wgpu::PrimitiveTopology,
+        samplers: &[(u32, u8, bool)],
+    ) -> Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)> {
+        self.made_on_draws += 1;
+        let started = std::time::Instant::now();
+        let (vkey, pkey, tasks) = self.module_tasks(key, vs, ps, inputs, varyings);
+        self.make_modules(tasks, 1, true, &mut |_| {});
+        let job = self.pipeline_job(key, ps, &vkey, &pkey, attributes, topology, samplers)?;
+        let t = std::time::Instant::now();
+        let made = build_pipeline(
+            &self.device,
+            self.pipeline_cache.as_ref().map(|c| &c.cache),
+            &job,
+        );
+        self.made.add_pipeline(t.elapsed(), started.elapsed());
+        if let Some(c) = &self.pipeline_cache {
+            c.touched(self.presents);
+        }
+        let took = started.elapsed();
+        if self.list.is_some() && took.as_secs_f64() > 0.001 {
+            eprintln!(
+                "NV_D3D9 wgpu: a pipeline made on first use: {:.1} ms (shaders {:016x} {:016x}, present {})",
+                took.as_secs_f64() * 1000.0,
+                vs.stable,
+                ps.stable,
+                self.presents
+            );
+        }
+        match made {
+            Ok(p) => Some((p, job.group_layout)),
+            Err(e) => {
                 self.warn(format!("a pipeline wgpu refuses: {e}"));
                 None
             }
@@ -3265,7 +4431,48 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 q.result = None;
                 q.read = None;
             }
+            // Its count is posted for the game's threads once the GPU has it
+            // ([`Device::post_answers`]).
+            if let Some(a) = &self.answers {
+                let ends = a.ended(query);
+                self.awaiting.push((query, ends));
+            }
         }
+    }
+
+    /// The occlusion counts the game's threads wait for ([`QueryAnswers`]): each awaited `END`'s
+    /// count read as `GetData` with `D3DGETDATA_FLUSH` reads it (its batch sent if it is not yet),
+    /// never waiting for the GPU, and posted once it is in. Whether any is still awaited.
+    fn post_answers(&mut self) -> bool {
+        if self.answers.is_none() || self.awaiting.is_empty() {
+            return false;
+        }
+        let mut awaiting = std::mem::take(&mut self.awaiting);
+        awaiting.retain(|&(query, ends)| {
+            let Some(a) = self.answers.clone() else {
+                return false;
+            };
+            // A later `END` of the same query supersedes this one.
+            if !a.awaits(query, ends) {
+                return false;
+            }
+            match self.query_get_data(query, GETDATA_FLUSH) {
+                Some((S_FALSE, _)) => true,
+                Some((_, count)) => {
+                    a.post(query, ends, count);
+                    false
+                }
+                None => false,
+            }
+        });
+        self.awaiting.extend(awaiting);
+        !self.awaiting.is_empty()
+    }
+
+    /// The render thread has nothing queued ([`d3d9_stream::Backend::idle`]): the awaited counts
+    /// polled and posted. Whether any is still awaited.
+    pub(crate) fn idle(&mut self) -> bool {
+        self.post_answers()
     }
 
     /// `GetData(flags)` of an occlusion query after its `END`, as Direct3D 9 answers it: `S_FALSE`
@@ -3449,36 +4656,36 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         pitch: u32,
     ) -> Option<d3d9_stream::Rows> {
         let src = self.surface_of(source)?;
-        if src.samples > 1 {
+        let read = if src.samples > 1 {
             // Direct3D 9 refuses a multisampled source (D3DERR_INVALIDCALL, as documented and
-            // measured on the real one here): nothing is copied, the destination keeps what it
-            // had, which its rows then give, as the real backend reads them.
+            // measured on the real one here): nothing is copied.
             self.warn(
                 "GetRenderTargetData of a multisampled render target: refused, as Direct3D 9 does",
             );
-            let natural = src.width * src.format.wgpu.block_copy_size(None).unwrap_or(4);
-            let kept = self
-                .kept
-                .get(&destination)
-                .filter(|k| k.len() as u32 == natural * src.height)?;
-            let row = if pitch == 0 { 0 } else { pitch.min(natural) };
-            let bytes = if row == 0 {
-                Vec::new()
-            } else {
-                kept.chunks(natural as usize)
-                    .flat_map(|r| r[..row as usize].to_vec())
-                    .collect()
-            };
-            return Some(d3d9_stream::Rows { row, bytes });
-        }
-        if src.format.upload != format::Upload::Copy {
+            None
+        } else if src.format.upload != format::Upload::Copy {
             self.warn(format!(
-                "GetRenderTargetData of format {:#x} is not provided",
+                "GetRenderTargetData of format {:#x} is not provided: the destination keeps what it had",
                 src.format.d3d
             ));
-            return None;
-        }
-        let bytes = self.read_level(&src)?;
+            None
+        } else {
+            let read = self.read_level(&src);
+            if read.is_none() {
+                // The read-back failed: the device is lost (a driver reset) or the format is not
+                // read back.
+                self.warn(
+                    "GetRenderTargetData: the render target could not be read back (a lost device?): the destination keeps what it had",
+                );
+            }
+            read
+        };
+        let Some(bytes) = read else {
+            // Nothing copied: the destination keeps what it had, which its rows then give, as the
+            // real backend reads them back after a refused or failed copy. So the caller goes on
+            // (a save's thumbnail after a driver reset: the model would stop the run on no answer).
+            return Some(self.rows_kept(destination, &src, pitch));
+        };
         if let Some(dst) = self.surface_of(destination) {
             if let (Some(st), Some(dt)) = (&src.tex, &dst.tex) {
                 if src.samples == 1
@@ -3537,10 +4744,64 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         Some(rows)
     }
 
+    /// The rows of `destination` (a system-memory level of `source`'s size and format, as the
+    /// model checked) as it holds them, when nothing was copied into it: its kept bytes, made
+    /// zeros of the level's size if it holds none yet (never written, or by a GPU that is lost),
+    /// so the game's lock of it reads them back as the real backend's does; `pitch` as in
+    /// [`Device::get_render_target_data`].
+    fn rows_kept(&mut self, destination: Handle, source: &Surf, pitch: u32) -> d3d9_stream::Rows {
+        let (natural, height) = format::level_layout(&source.format, source.width, source.height);
+        let size = (natural * height) as usize;
+        let mut zeros = Vec::new();
+        let kept = match self.kept.get_mut(&destination) {
+            Some(k) => {
+                if k.len() != size {
+                    k.clear();
+                    k.resize(size, 0);
+                }
+                k
+            }
+            None => {
+                zeros.resize(size, 0);
+                &mut zeros
+            }
+        };
+        let row = if pitch == 0 { 0 } else { pitch.min(natural) };
+        let bytes = if row == 0 {
+            Vec::new()
+        } else {
+            kept.chunks(natural.max(1) as usize)
+                .flat_map(|r| r[..row as usize].iter().copied())
+                .collect()
+        };
+        d3d9_stream::Rows { row, bytes }
+    }
+
     // Present.
+
+    /// Shows `p` in the game's window ([`loading`]): for a long step of the backend's own before
+    /// play, which calls it as it goes. Only a device on the game's window draws it; every call
+    /// also writes one log line with the same numbers (for a launcher). The game's own frames
+    /// are not touched: the next `Present` shows the game again.
+    pub fn show_progress(&mut self, p: &loading::Progress) {
+        show_on(
+            &mut self.surface,
+            &mut self.loading,
+            &self.device,
+            &self.queue,
+            p,
+        );
+    }
 
     /// `Present` of the stream's `frame` (numbered as the forwarding layer's captures are).
     pub(crate) fn present(&mut self, frame: u32) {
+        let now = std::time::Instant::now();
+        if let Some(t) = self.last_present {
+            self.made.longest_frame = self.made.longest_frame.max(now - t);
+        }
+        self.last_present = Some(now);
+        // Listed pipelines whose shaders the game has now made, made before its next frame.
+        self.prepare_listed();
         self.end_pass();
         self.presents += 1;
         let frame = u64::from(frame);
@@ -3584,74 +4845,60 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         }
         let mut frame_texture = None;
         let mut window_shot = None;
-        if let (Some((surface, config)), Some(b)) = (&self.surface, &back) {
-            // An outdated or lost surface (the window resized, the display changed) is configured
-            // again and asked once more; a frame that cannot be had now (minimised, timed out) is
-            // skipped, as Direct3D 9's Present then shows nothing.
-            let mut acquired = None;
-            for _ in 0..2 {
-                match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(t) => acquired = Some(t),
-                    wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                        acquired = Some(t);
-                    }
-                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                        surface.configure(&self.device, config);
-                        continue;
-                    }
-                    _ => {}
-                }
-                break;
+        // The window's frame at its size now ([`crate::window`]); none while it is minimised,
+        // gives none in time or is lost (the frame is skipped, as Direct3D 9's Present then shows
+        // nothing, and the game goes on).
+        let taken = match (&mut self.surface, &back) {
+            (Some(w), Some(_)) => w.frame(&self.device).map(|t| (t, w.config.usage)),
+            _ => None,
+        };
+        if let (Some((t, usage)), Some(b)) = (taken, &back) {
+            // The frame's own size and format, as the swap chain gave it.
+            let (format, cw, ch) = (t.texture.format(), t.texture.width(), t.texture.height());
+            let view = t.texture.create_view(&Default::default());
+            let copyable = usage.contains(wgpu::TextureUsages::COPY_SRC);
+            let sv = b.view.clone().expect("the back buffer's view");
+            let size = (b.width, b.height);
+            // Over the whole client area, as Direct3D 9's windowed Present without
+            // rectangles: a copy at the same size, filtered when the window's differs.
+            self.blit_into(
+                &sv,
+                size,
+                [0.0, 0.0, size.0 as f32, size.1 as f32],
+                &view,
+                (format, false),
+                [0.0, 0.0, cw as f32, ch as f32],
+                size != (cw, ch),
+            );
+            // With a capture, the frame the window gets too (`wgpu-window-N.bmp`): the
+            // swapchain's own texture, read back before it is presented.
+            if shot && copyable && format == wgpu::TextureFormat::Bgra8Unorm {
+                let row = (cw * 4).div_ceil(256) * 256;
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("window shot"),
+                    size: u64::from(row * ch),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                self.encoder().copy_texture_to_buffer(
+                    t.texture.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row),
+                            rows_per_image: Some(ch),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: cw,
+                        height: ch,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                window_shot = Some((buffer, row, cw, ch));
             }
-            match acquired {
-                Some(t) => {
-                    let view = t.texture.create_view(&Default::default());
-                    let format = config.format;
-                    let (cw, ch) = (config.width, config.height);
-                    let copyable = config.usage.contains(wgpu::TextureUsages::COPY_SRC);
-                    let sv = b.view.clone().expect("the back buffer's view");
-                    let size = (b.width, b.height);
-                    self.blit_into(
-                        &sv,
-                        size,
-                        [0.0, 0.0, size.0 as f32, size.1 as f32],
-                        &view,
-                        (format, false),
-                        [0.0, 0.0, cw as f32, ch as f32],
-                        false,
-                    );
-                    // With a capture, the frame the window gets too (`wgpu-window-N.bmp`): the
-                    // swapchain's own texture, read back before it is presented.
-                    if shot && copyable && format == wgpu::TextureFormat::Bgra8Unorm {
-                        let row = (cw * 4).div_ceil(256) * 256;
-                        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("window shot"),
-                            size: u64::from(row * ch),
-                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                            mapped_at_creation: false,
-                        });
-                        self.encoder().copy_texture_to_buffer(
-                            t.texture.as_image_copy(),
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: &buffer,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(row),
-                                    rows_per_image: Some(ch),
-                                },
-                            },
-                            wgpu::Extent3d {
-                                width: cw,
-                                height: ch,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        window_shot = Some((buffer, row, cw, ch));
-                    }
-                    frame_texture = Some(t);
-                }
-                None => self.warn("a frame the window could not take (skipped)"),
-            }
+            frame_texture = Some(t);
         }
         self.flush();
         if let Some(t) = frame_texture {
@@ -3701,19 +4948,145 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
                 }
             }
         }
+        // Bind groups of textures destroyed this frame dropped.
+        self.purge_destroyed();
+        // The counts the GPU has now posted for the game's threads.
+        self.post_answers();
+        if let Some(c) = &mut self.pipeline_cache {
+            c.save_if_due(self.presents, false);
+        }
+        if let Some(l) = &mut self.list {
+            l.save_if_due(self.presents, false);
+        }
         if self.presents % 600 == 1 {
             // The bytes kept for read-backs (`ReadSurface`), printed for their memory cost.
             let kept: usize = self.kept.values().map(Vec::len).sum();
             eprintln!(
-                "NV_D3D9 wgpu: present {frame}: {} draws, {} skipped, {} pipelines, {} wgpu errors, {:.1} MB kept for read-backs ({} levels)",
+                "NV_D3D9 wgpu: present {frame}: {} draws, {} skipped, {} pipelines, {} bind groups, {} wgpu errors, {:.1} MB kept for read-backs ({} levels){}",
                 self.draws,
                 self.skipped,
                 self.pipelines.len(),
+                self.groups.len(),
                 self.errors.load(Ordering::Relaxed),
                 kept as f64 / 1_048_576.0,
-                self.kept.values().filter(|k| !k.is_empty()).count()
+                self.kept.values().filter(|k| !k.is_empty()).count(),
+                self.surface.as_ref().map_or(String::new(), |w| format!(
+                    ", the window's swap chain configured {} times ({} refused)",
+                    w.configures, w.refused
+                ))
             );
+            self.report_made();
         }
+    }
+
+    /// The pipeline report (with the present counters, and once more when the device goes): the
+    /// game's pipelines made on the draws that needed them since the last report (the backend's
+    /// own few for clears, copies and counts are not counted, nor kept in the pipeline cache), what
+    /// that took, and the longest time between two presents on this thread.
+    fn report_made(&mut self) {
+        let m = std::mem::take(&mut self.made);
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "NV_D3D9 wgpu: made since the last report: {} pipelines ({} shader modules) in {:.0} ms on the draws that needed them (of it converting {:.0}, modules {:.0}, pipelines {:.0}); the longest pipeline {:.0} ms, {} pipelines over 16 ms; the longest time between two presents here {:.0} ms",
+            m.pipelines,
+            m.modules,
+            ms(m.whole),
+            ms(m.convert),
+            ms(m.module),
+            ms(m.pipeline),
+            ms(m.longest),
+            m.over_16ms,
+            ms(m.longest_frame)
+        );
+    }
+
+    /// What the device made of its pipeline cache file ("N KB read", "none yet...", "...: ignored...");
+    /// None without a cache (no folder, or a backend without one). Tests.
+    pub fn pipeline_cache_note(&self) -> Option<String> {
+        self.pipeline_cache.as_ref().map(|c| c.note.clone())
+    }
+
+    /// The errors wgpu reported so far (a refused pass or submit among them; tests).
+    pub fn wgpu_errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Loses the device, as a driver reset (TDR) or a removed graphics card does: from now on
+    /// nothing reaches the GPU and nothing is read back from it (tests).
+    pub fn lose(&self) {
+        self.device.destroy();
+    }
+
+    /// The window's swap chain asked in `format` from the next frame on, on a surface made anew
+    /// and never configured with `new_surface` (as after a lost one); a format the surface does not
+    /// offer is refused by wgpu, as a configuration a driver refuses (tests).
+    pub fn reconfigure_window_for_tests(&mut self, format: wgpu::TextureFormat, new_surface: bool) {
+        if let Some(w) = &mut self.surface {
+            w.retarget_for_tests(format, new_surface);
+        }
+    }
+
+    /// The screen of [`Device::show_progress`] drawn into a `width` by `height` texture of its own,
+    /// its pixels B, G, R, A rows packed (tests: an offscreen device has no window to show it in).
+    pub fn progress_pixels(&mut self, width: u32, height: u32, p: &loading::Progress) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("loading screen test"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let mut screen = loading::Screen::new(&self.device, &self.queue, format);
+        screen.draw(&self.device, &self.queue, &view, (width, height), p);
+        let row = (width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let mut out = Vec::with_capacity((width * height * 4) as usize);
+        if let Ok(data) = buffer.slice(..).get_mapped_range() {
+            for y in 0..height {
+                out.extend_from_slice(&data[(y * row) as usize..(y * row + width * 4) as usize]);
+            }
+        }
+        buffer.unmap();
+        out
+    }
+
+    /// How many pipelines were made on the draw that needed them, not ahead from the list (tests).
+    pub fn pipelines_made_on_draws(&self) -> u64 {
+        self.made_on_draws
     }
 
     /// The pixels of a back buffer or render target as wgpu holds them, rows packed (tests).
@@ -3725,10 +5098,10 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
 
     pub(crate) fn reset(&mut self, pp: &PresentParameters, back_buffers: &[Handle], depth: Handle) {
         self.flush();
-        if let Some((surface, config)) = &mut self.surface {
-            config.width = pp.width.max(1);
-            config.height = pp.height.max(1);
-            surface.configure(&self.device, config);
+        // The swap chain stays the window's size; configured again before the next frame, in the
+        // new present interval's mode.
+        if let Some(w) = &mut self.surface {
+            w.reset(pp.interval);
         }
         // Reset returns the device to its defaults: every state, binding and register; the caches
         // that hold old resources go.
@@ -3743,14 +5116,16 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
         st.decl = None;
         st.streams = Default::default();
         st.indices = None;
-        *st.vsf = [[0; 4]; 256];
+        *st.vsf = [0; 4096];
         st.vsi = [[0; 4]; 16];
         st.vsb = [0; 16];
-        *st.psf = [[0; 4]; 256];
+        *st.psf = [0; 4096];
         st.psi = [[0; 4]; 16];
         st.psb = [0; 16];
         st.clip = [[0; 4]; wgsl::CLIP_PLANES];
-        st.dirty = true;
+        st.dirty = [true; 2];
+        st.header_dirty = [true; 2];
+        st.bound = Bound::default();
         self.counting = None;
         self.groups.clear();
         self.depth_parts.clear();
@@ -3764,37 +5139,46 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_i
     }
 }
 
-/// One stage's register block (`Regs` of the converted shaders) at the end of the ring: float,
-/// integer and boolean registers, the system values, each sampler's fill mode and LOD bias. Its
-/// offset.
-fn write_block(
-    ring: &mut Vec<u8>,
-    f: &[[u32; 4]; 256],
+/// The bytes of a register block before its float constants (`Regs` up to `c`).
+const HEADER: usize = wgsl::REGS_C_OFFSET as usize;
+
+/// One stage's block header (`Regs` of the converted shaders up to `c`): the integer and boolean
+/// registers, the system values, each sampler's fill mode and LOD bias, the clip planes.
+fn block_header(
     i: &[[u32; 4]; 16],
     b: &[u32; 16],
     sys: [f32; 4],
     (fix, bias): ([u32; 16], [f32; 16]),
     clip: &[[u32; 4]; wgsl::CLIP_PLANES],
-) -> u32 {
+) -> [u8; HEADER] {
+    let words = i
+        .iter()
+        .flatten()
+        .copied()
+        .chain(b.iter().copied())
+        .chain(sys.iter().map(|v| v.to_bits()))
+        .chain([0u32; 12])
+        .chain(fix)
+        .chain(bias.iter().map(|v| v.to_bits()))
+        .chain(clip.iter().flatten().copied());
+    let mut out = [0u8; HEADER];
+    let mut n = 0;
+    for (d, w) in out.chunks_exact_mut(4).zip(words) {
+        d.copy_from_slice(&w.to_le_bytes());
+        n += 4;
+    }
+    debug_assert_eq!(n, HEADER);
+    out
+}
+
+/// One stage's register block at the end of the ring: its header ([`block_header`]), then the
+/// float registers' bytes `f` (those the stage's shader reads: the rest of the block's range is
+/// never read). Its offset; the ring grows by the block rounded up to the offset alignment.
+fn write_block(ring: &mut Vec<u8>, header: &[u8; HEADER], f: &[u8]) -> u32 {
     let at = ring.len();
-    for w in f.iter().chain(i.iter()).flatten().chain(b.iter()) {
-        ring.extend_from_slice(&w.to_le_bytes());
-    }
-    for v in sys {
-        ring.extend_from_slice(&v.to_le_bytes());
-    }
-    ring.extend_from_slice(&[0u8; 48]);
-    for w in fix {
-        ring.extend_from_slice(&w.to_le_bytes());
-    }
-    for v in bias {
-        ring.extend_from_slice(&v.to_le_bytes());
-    }
-    for w in clip.iter().flatten() {
-        ring.extend_from_slice(&w.to_le_bytes());
-    }
-    debug_assert_eq!((ring.len() - at) as u64, wgsl::REGS_SIZE);
-    ring.resize(at + BLOCK as usize, 0);
+    ring.extend_from_slice(header);
+    ring.extend_from_slice(f);
+    ring.resize(at + (HEADER + f.len()).div_ceil(256) * 256, 0);
     at as u32
 }
 
@@ -3943,9 +5327,63 @@ fn dummies(device: &wgpu::Device, queue: &wgpu::Queue) -> [wgpu::TextureView; 3]
     ]
 }
 
+/// The graphics APIs the device is made on, in the order tried, and whether the software adapter
+/// is asked for, by `NV_WGPU_BACKEND`'s value (`None` unset; case and spaces aside):
+/// - unset: Vulkan, then Direct3D 12 for a card without a Vulkan driver (Windows; elsewhere the
+///   platform's own). Vulkan is the renderer (the maintainer, 2026-11-11: "we are trying to focus
+///   solely on wgpu and vulkan, as those brings the most improvements and compatability"). Its
+///   pictures differ from the real Direct3D 9's in faint texture filtering far off (NVIDIA filters
+///   anisotropically otherwise on Vulkan than on its Direct3D: town1, 10-26% of pixels by a mean
+///   of 0.2-0.8 levels against 0.3-0.6% on Direct3D 12; accepted by the lead, 2026-11-10).
+/// - `vulkan`, `dx12`, `gl`, `metal`: that one alone.
+/// - `software`: the platform's software adapter (WARP on Windows, the one CI's runners have),
+///   for checking that the backend does not depend on one card's leniency.
+pub(crate) fn apis(asked: Option<&str>) -> (Vec<wgpu::Backends>, bool) {
+    let asked = asked.map(|v| v.trim().to_ascii_lowercase());
+    let one = match asked.as_deref() {
+        Some("vulkan") => Some(wgpu::Backends::VULKAN),
+        Some("dx12") => Some(wgpu::Backends::DX12),
+        Some("gl") => Some(wgpu::Backends::GL),
+        Some("metal") => Some(wgpu::Backends::METAL),
+        _ => None,
+    };
+    let software = asked.as_deref() == Some("software");
+    let tries = match one {
+        Some(b) => vec![b],
+        None if software && cfg!(windows) => vec![wgpu::Backends::DX12, wgpu::Backends::PRIMARY],
+        None if cfg!(windows) => vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12],
+        None => vec![wgpu::Backends::PRIMARY],
+    };
+    (tries, software)
+}
+
+/// A graphics card wgpu can draw with (not a software adapter) on the APIs `NV_WGPU_BACKEND` allows,
+/// in [`apis`]' order: its name and API, or none. `NV_WGPU_BACKEND=software` asks for the software
+/// adapter, so it answers that one.
+pub fn hardware_adapter() -> Option<String> {
+    let (tries, software) = apis(std::env::var("NV_WGPU_BACKEND").ok().as_deref());
+    if software {
+        return Some("the software adapter (NV_WGPU_BACKEND=software)".into());
+    }
+    tries.into_iter().find_map(|backends| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        block_on(instance.enumerate_adapters(backends))
+            .into_iter()
+            .map(|a| a.get_info())
+            .find(|i| i.device_type != wgpu::DeviceType::Cpu)
+            .map(|i| format!("{} ({:?})", i.name, i.backend))
+    })
+}
+
 /// The surface of a real window (Windows: an `HWND`).
 #[cfg(windows)]
-fn surface_for(instance: &wgpu::Instance, window: isize) -> Result<wgpu::Surface<'static>, String> {
+pub(crate) fn surface_for(
+    instance: &wgpu::Instance,
+    window: isize,
+) -> Result<wgpu::Surface<'static>, String> {
     use raw_window_handle::{
         RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
     };
@@ -3973,11 +5411,363 @@ extern "system" {
 }
 
 #[cfg(not(windows))]
-fn surface_for(
+pub(crate) fn surface_for(
     _instance: &wgpu::Instance,
     _window: isize,
 ) -> Result<wgpu::Surface<'static>, String> {
     Err("windows of other platforms come with the window layer's port".into())
+}
+
+/// A vertex module's cache key: the shader, the inputs its declaration gives, the varyings and
+/// centroid flags of the pixel shader it feeds, the clip code.
+type VKey = (
+    u64,
+    Vec<wgsl::Input>,
+    Vec<wgsl::Semantic>,
+    Vec<bool>,
+    wgsl::Clip,
+);
+/// A pixel module's cache key: the shader, its varyings, the occlusion count, the clip code.
+type PKey = (u64, Vec<wgsl::Semantic>, bool, wgsl::Clip);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ModKey {
+    V(VKey),
+    P(PKey),
+}
+
+/// A listed pipeline's live key and parts ([`Device::key_of_entry`]).
+struct Ready {
+    key: PipeKey,
+    vs: Arc<Shader>,
+    ps: Arc<Shader>,
+    link: Arc<VertexLink>,
+    topology: wgpu::PrimitiveTopology,
+    samplers: Vec<(u32, u8, bool)>,
+}
+
+/// The clip code as the list writes it ([`prepare::Entry::clip`]).
+fn clip_code(c: wgsl::Clip) -> u8 {
+    match c {
+        wgsl::Clip::Off => 0,
+        wgsl::Clip::Distances => 1,
+        wgsl::Clip::Discard { per_sample: false } => 2,
+        wgsl::Clip::Discard { per_sample: true } => 3,
+    }
+}
+
+/// One module to make: its WGSL (or why there is none) and what converting it took.
+struct ModuleTask {
+    key: ModKey,
+    source: Result<String, sm::Error>,
+    convert: std::time::Duration,
+}
+
+/// Everything a render pipeline is made from, owned, so worker threads can make it.
+struct PipelineJob {
+    layout: wgpu::PipelineLayout,
+    group_layout: wgpu::BindGroupLayout,
+    vm: wgpu::ShaderModule,
+    pm: wgpu::ShaderModule,
+    /// Each stream slot up to the last used: its stride and attributes.
+    buffers: Vec<Option<(u64, Vec<wgpu::VertexAttribute>)>>,
+    primitive: wgpu::PrimitiveState,
+    depth_stencil: Option<wgpu::DepthStencilState>,
+    multisample: wgpu::MultisampleState,
+    targets: Vec<Option<wgpu::ColorTargetState>>,
+}
+
+/// [`Device::show_progress`] on the device's parts (so it can run while other parts are lent out).
+fn show_on(
+    surface: &mut Option<crate::window::Window>,
+    screen: &mut Option<loading::Screen>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    p: &loading::Progress,
+) {
+    eprintln!(
+        "NV_D3D9 wgpu: {}: {} ({:.0}%)",
+        p.title,
+        p.status,
+        p.done.clamp(0.0, 1.0) * 100.0
+    );
+    let Some(window) = surface else {
+        return;
+    };
+    // As a `Present` does ([`crate::window`]): the window's frame at its size now, none while it
+    // is minimised, gives none in time or is lost (not drawn then).
+    let Some(frame) = window.frame(device) else {
+        return;
+    };
+    let config = &window.config;
+    let view = frame.texture.create_view(&Default::default());
+    // Made again if the window's format changed since (its pipeline is made for one).
+    if screen.as_ref().is_some_and(|s| s.format != config.format) {
+        *screen = None;
+    }
+    let screen = screen.get_or_insert_with(|| loading::Screen::new(device, queue, config.format));
+    screen.draw(device, queue, &view, (config.width, config.height), p);
+    queue.present(frame);
+}
+
+/// Makes a module from WGSL: read and checked once, by wgpu (naga's reader and validator, with
+/// the device's own capabilities); what it refuses, as text.
+fn create_module(device: &wgpu::Device, source: String) -> Result<wgpu::ShaderModule, String> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    match block_on(scope.pop()) {
+        None => Ok(module),
+        Some(e) => Err(e.to_string()),
+    }
+}
+
+/// Makes the pipeline `job` describes (with the driver's cache, where there is one).
+fn build_pipeline(
+    device: &wgpu::Device,
+    cache: Option<&wgpu::PipelineCache>,
+    job: &PipelineJob,
+) -> Result<wgpu::RenderPipeline, String> {
+    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = job
+        .buffers
+        .iter()
+        .map(|b| {
+            b.as_ref().map(|(stride, a)| wgpu::VertexBufferLayout {
+                array_stride: *stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: a,
+            })
+        })
+        .collect();
+    let desc = wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&job.layout),
+        vertex: wgpu::VertexState {
+            module: &job.vm,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            buffers: &buffers,
+        },
+        primitive: job.primitive,
+        depth_stencil: job.depth_stencil.clone(),
+        multisample: job.multisample,
+        fragment: Some(wgpu::FragmentState {
+            module: &job.pm,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            targets: &job.targets,
+        }),
+        multiview_mask: None,
+        cache,
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let pipeline = device.create_render_pipeline(&desc);
+    match block_on(scope.pop()) {
+        None => Ok(pipeline),
+        Some(e) => Err(e.to_string()),
+    }
+}
+
+/// `f` of each of `items`, on up to `threads` worker threads below normal priority (1: on this
+/// thread), the results in the items' order. `tick` runs on this thread meanwhile, about four
+/// times a second, with how many are done (the loading screen).
+fn on_workers<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> R + Sync,
+    tick: &mut dyn FnMut(usize),
+) -> Vec<R> {
+    if threads <= 1 || items.len() <= 1 {
+        let mut last: Option<std::time::Instant> = None;
+        return items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                if !matches!(last, Some(t) if t.elapsed().as_millis() < 250) {
+                    tick(i);
+                    last = Some(std::time::Instant::now());
+                }
+                f(item)
+            })
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<R>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        let mut workers = Vec::new();
+        for _ in 0..threads.min(items.len()) {
+            workers.push(s.spawn(|| {
+                lower_priority();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = f(item);
+                    *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        // Until every worker is out (also one that panicked: the scope then passes it on).
+        let mut last: Option<std::time::Instant> = None;
+        loop {
+            let d = done.load(Ordering::Relaxed);
+            if d >= items.len() || workers.iter().all(|w| w.is_finished()) {
+                break;
+            }
+            // Four times a second: each call presents (with the display's sync, a frame's wait).
+            if !matches!(last, Some(t) if t.elapsed().as_millis() < 250) {
+                tick(d);
+                last = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    results
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every item done")
+        })
+        .collect()
+}
+
+/// The worker threads making pipelines ahead run below normal priority, so the game's own
+/// threads and the menus keep theirs.
+fn lower_priority() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        /// `THREAD_PRIORITY_BELOW_NORMAL`.
+        const BELOW_NORMAL: i32 = -1;
+        // SAFETY: the current thread's pseudo handle and a documented priority value.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), BELOW_NORMAL);
+        }
+    }
+}
+
+/// How many worker threads make pipelines ahead: fewer than the machine's cores (two left for
+/// the game's main thread and the render thread), at least one.
+fn worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .saturating_sub(2)
+        .clamp(1, 16)
+}
+
+/// Draws an encoder takes before it goes to a finishing thread ([`Device::send_encoder`]).
+const SPLIT_DRAWS: u32 = 256;
+
+/// An earlier encoder of the batch: finished, or on its way from a finishing thread.
+enum Finishing {
+    Ready(wgpu::CommandBuffer),
+    Pending(std::sync::mpsc::Receiver<Result<wgpu::CommandBuffer, String>>),
+}
+
+/// A job for a finishing thread: the encoder, and where its command buffer goes.
+type FinishJob = (
+    wgpu::CommandEncoder,
+    std::sync::mpsc::SyncSender<Result<wgpu::CommandBuffer, String>>,
+);
+
+/// The threads that finish the render thread's encoders ([`Device::send_encoder`]). wgpu records a
+/// pass as a list of commands and does all of its checking, resource tracking and the driver's
+/// recording when the encoder is finished (most of what wgpu and the driver cost a crowded frame,
+/// measure/wgpu/CROWD.md); finishing takes the device's resource lock only for reading, so
+/// encoders are finished side by side while the render thread goes on.
+struct Finisher {
+    jobs: Option<std::sync::mpsc::Sender<FinishJob>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Finisher {
+    /// Two threads where the machine has six or more logical processors, one with four or five,
+    /// none below (the encoders are then finished at the submit, as before).
+    fn for_this_machine() -> Option<Finisher> {
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = match n {
+            6.. => 2,
+            4..=5 => 1,
+            _ => 0,
+        };
+        (threads > 0).then(|| Finisher::new(threads))
+    }
+
+    fn new(threads: usize) -> Finisher {
+        let (jobs, queue) = std::sync::mpsc::channel::<FinishJob>();
+        let queue = Arc::new(std::sync::Mutex::new(queue));
+        let threads = (0..threads)
+            .map(|k| {
+                let queue = Arc::clone(&queue);
+                std::thread::Builder::new()
+                    .name(format!("nv-wgpu-finish {k}"))
+                    .spawn(move || loop {
+                        let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((encoder, back)) = job else { break };
+                        // The render thread waits for it at the submit (a panic's message too, so
+                        // it can say why); gone (the device dropped), the buffer is dropped too.
+                        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            encoder.finish()
+                        }))
+                        .map_err(|p| {
+                            p.downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| p.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "a panic without a message".to_string())
+                        });
+                        let _ = back.send(done);
+                    })
+                    .expect("a finishing thread starts")
+            })
+            .collect();
+        Finisher {
+            jobs: Some(jobs),
+            threads,
+        }
+    }
+
+    fn send(&self, encoder: wgpu::CommandEncoder) -> Finishing {
+        let (back, buffer) = std::sync::mpsc::sync_channel(1);
+        match self.jobs.as_ref().map(|j| j.send((encoder, back))) {
+            Some(Ok(())) => Finishing::Pending(buffer),
+            // The threads are gone: finished here.
+            Some(Err(std::sync::mpsc::SendError((encoder, _)))) => {
+                Finishing::Ready(encoder.finish())
+            }
+            None => unreachable!("the jobs' sender lives until the finisher is dropped"),
+        }
+    }
+}
+
+impl Drop for Finisher {
+    fn drop(&mut self) {
+        self.jobs = None;
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Device {
+    /// The pipeline cache written once more when pipelines were made since its last save.
+    fn drop(&mut self) {
+        self.report_made();
+        if let Some(c) = &mut self.pipeline_cache {
+            c.save_if_due(self.presents, true);
+        }
+        if let Some(l) = &mut self.list {
+            l.save_if_due(self.presents, true);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4026,5 +5816,23 @@ mod tests {
         // 255: nothing is above it; 0: everything is at or above it.
         assert!(alpha_bounds(255).0 >= 4096.0);
         assert!(alpha_bounds(0).1 < 0.0);
+    }
+
+    /// Vulkan first, Direct3D 12 for a card without a Vulkan driver; a named API alone; the
+    /// software adapter on Direct3D 12 (WARP, CI's) as before.
+    #[test]
+    fn vulkan_is_tried_first_and_a_named_api_alone() {
+        use wgpu::Backends as B;
+        if cfg!(windows) {
+            assert_eq!(apis(None), (vec![B::VULKAN, B::DX12], false));
+            assert_eq!(apis(Some("")), (vec![B::VULKAN, B::DX12], false));
+            assert_eq!(apis(Some("bogus")), (vec![B::VULKAN, B::DX12], false));
+            assert_eq!(apis(Some("software")), (vec![B::DX12, B::PRIMARY], true));
+        }
+        assert_eq!(apis(Some("vulkan")), (vec![B::VULKAN], false));
+        assert_eq!(apis(Some(" Vulkan ")), (vec![B::VULKAN], false));
+        assert_eq!(apis(Some("dx12")), (vec![B::DX12], false));
+        assert_eq!(apis(Some("gl")), (vec![B::GL], false));
+        assert_eq!(apis(Some("metal")), (vec![B::METAL], false));
     }
 }

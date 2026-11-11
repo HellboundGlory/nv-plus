@@ -366,6 +366,18 @@ mod tests {
         assert_ne!(entry.attributes & files::FILE_ATTRIBUTE_ARCHIVE, 0);
     }
 
+    /// Each write stamps the file as changed, so the settings copy-out (`NV_PREFS_OUT`) sees it.
+    #[test]
+    fn a_write_stamps_the_file_as_changed() {
+        let mut e = engine();
+        files::write_whole(&mut e, PREFS, b"[Controls]\r\nBack=1F\r\n".to_vec());
+        let k = br"z:\data\falloutprefs.ini".to_vec();
+        let first = state!(e).disk.stamps.get(&k).copied();
+        assert!(first.is_some());
+        assert_eq!(write(&mut e, b"Controls", b"Back", b"2EE", PREFS), 1);
+        assert!(state!(e).disk.stamps.get(&k).copied() > first);
+    }
+
     /// A new key in an existing section goes after that section's last non-blank line.
     #[test]
     fn a_new_key_follows_its_sections_last_line() {
